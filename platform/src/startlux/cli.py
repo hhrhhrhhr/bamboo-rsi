@@ -18,7 +18,7 @@ def main():
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("scenarios")
     rsi = commands.add_parser("rsi-genshin", help="durable prospective RSI coordinator")
-    rsi.add_argument("operation", choices=["init", "status", "cycle", "serve", "resume", "stop", "rollback", "enable-codex"])
+    rsi.add_argument("operation", choices=["init", "status", "cycle", "serve", "resume", "stop", "rollback", "enable-codex", "enable-native"])
     rsi.add_argument("--home", type=Path, required=True)
     rsi.add_argument("--root", type=Path)
     rsi.add_argument("--host", type=Path)
@@ -26,6 +26,8 @@ def main():
     rsi.add_argument("--wsl-python")
     rsi.add_argument("--wsl-distribution", default="Ubuntu-24.04")
     rsi.add_argument("--codex-executable", default="codex")
+    rsi.add_argument("--native-source", type=Path)
+    rsi.add_argument("--dotnet", type=Path)
     rsi.add_argument("--max-codex-calls", type=int, default=8)
     rsi.add_argument("--refresh-program-baseline", action="store_true",
                      help="record an idle developer migration before any code promotion")
@@ -68,6 +70,11 @@ def main():
                 parser.error("RSI init needs --root and --host")
             result = initialize(args.home, args.root, args.host, blocked_quota=args.blocked_quota,
                                 wsl_python=args.wsl_python, distribution=args.wsl_distribution)
+        elif args.operation == "enable-native":
+            from .scenarios.genshin.rsi_native import enable_native
+            if args.native_source is None or args.dotnet is None:
+                parser.error("enable-native needs --native-source and --dotnet")
+            result = enable_native(args.home, args.native_source, args.dotnet)
         elif args.operation == "enable-codex":
             from .scenarios.genshin.rsi_program import enable_codex
             result = enable_codex(args.home, args.root or store.read("config.json")["root"],

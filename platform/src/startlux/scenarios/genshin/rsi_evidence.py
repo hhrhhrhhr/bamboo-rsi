@@ -74,7 +74,7 @@ def verify_enrolled_day(home, plan, enrollment):
                 raise ValueError("unknown or ambiguous quest family")
             quest_types.extend(matches)
         quest_types.sort()
-        expected_build = dict(plan.execution_build)
+        expected_build = dict(plan.expected_build(bundle.identity))
         if bundle.combat:
             expected_build[bundle.combat.relative_path] = hashlib.sha256(bundle.combat.script.encode()).hexdigest()
         if baseline_build != expected_build or assessment["runtime_sha256"] != plan.expected_runtime(bundle.identity):
@@ -98,6 +98,12 @@ def verify_enrolled_day(home, plan, enrollment):
                     or resources[0][1].get("manifest_sha256") != hashlib.sha256((pack.root / "manifest.json").read_bytes()).hexdigest()):
                 raise ValueError("program build is not bound before game input")
             program_fields = {"program": identity, "evaluator_sha256": plan.evaluator_sha256}
+            from .rsi_native import binding_verified
+            if (manifest.get("native_program") != plan.native_by_bundle.get(bundle.identity)
+                    or not binding_verified(home, manifest, records, metadata)):
+                raise ValueError("native execution was not bound before input")
+            if manifest.get("native_program"):
+                program_fields["native_program"] = manifest["native_program"]
         start, end = map(datetime.fromisoformat, (metadata["started_at"], metadata["ended_at"]))
         if start.tzinfo is None or end.tzinfo is None or end <= start:
             raise ValueError("invalid run clock")

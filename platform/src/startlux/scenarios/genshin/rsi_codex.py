@@ -15,13 +15,16 @@ from ...core.model_budget import CallBudget
 from ...core.storage import atomic_json
 from .episode import utc_now
 from .rsi_program import ADAPTER, EDITABLE, ProgramStore, bundle_program, clean_env, sha
+from .rsi_native import EDITABLE as NATIVE_EDITABLE, PREFIX as NATIVE_PREFIX, NativeStore
+
+PROPOSAL_PATHS = EDITABLE | NATIVE_EDITABLE
 
 
 SCHEMA = {"type": "object", "additionalProperties": False,
           "properties": {"summary": {"type": "string"}, "hypothesis": {"type": "string"},
                          "changes": {"type": "array", "items": {
                              "type": "object", "additionalProperties": False,
-                             "properties": {"path": {"type": "string", "enum": sorted(EDITABLE)},
+                             "properties": {"path": {"type": "string", "enum": sorted(PROPOSAL_PATHS)},
                                             "before_sha256": {"type": "string"},
                                             "content": {"type": "string"}},
                              "required": ["path", "before_sha256", "content"]}}},
@@ -58,11 +61,29 @@ def proposal_context(job, parent, programs):
         path = programs.home / "rsi/base-pack/autocommission" / name
         if path.is_file():
             references[name] = {"content": path.read_text(encoding="utf-8")[:18000], "editable": False}
+    native_sources = {}
+    if manifest.get("native_program"):
+        native = NativeStore(programs.home)
+        value = native.verify(manifest["native_program"])
+        native_sources = {name: {"sha256": value["files"][name[len(NATIVE_PREFIX):]],
+            "content": (native.directory(manifest["native_program"]) / "source" / name[len(NATIVE_PREFIX):]).read_text(encoding="utf-8")}
+            for name in sorted(NATIVE_EDITABLE)}
+        native_root = native.directory(manifest["native_program"]) / "source"
+        for name in ("Test/BetterGenshinImpact.AgentBridge.Tests/AgentFlightInputTests.cs",
+                     "BetterGenshinImpact/GameTask/AutoPathing/PathExecutor.cs"):
+            path = native_root / name
+            if path.is_file():
+                text = path.read_text(encoding="utf-8")
+                if name.endswith("PathExecutor.cs"):
+                    marker = text.find("ShouldOpen(")
+                    text = text[max(0, marker - 3500):marker + 3500] if marker >= 0 else text[:7000]
+                references[NATIVE_PREFIX + name] = {"content": text, "editable": False}
     return {"parent_bundle": parent.identity, "parent_program": identity,
-            "sources": {name: {"sha256": manifest["resources"]["agent-main.js"] if name == ADAPTER else manifest["files"][name],
+            "parent_native_program": manifest.get("native_program"),
+            "sources": {**{name: {"sha256": manifest["resources"]["agent-main.js"] if name == ADAPTER else manifest["files"][name],
                                "content": ((programs.directory(identity) / "resources/agent-main.js")
                                            if name == ADAPTER else (source / name)).read_text(encoding="utf-8")}
-                        for name in sorted(EDITABLE)},
+                        for name in sorted(EDITABLE)}, **native_sources},
             "training_days": job["training_days"], "failures": redact(failures[-24:]),
             "failure_selection": "last_24_training_failures", "readonly_upstream_references": references,
             "native_diagnostics": redact(job.get("native_diagnostics", [])),
@@ -97,6 +118,8 @@ def invoke(context, output, executable, *, stop_path, timeout=600, model=None, p
         "binding, bounded retries, stop acknowledgements, real journal verification, recording and "
         "required combat. Never equate timeout/exit status with success. Do not change tests, gates, "
         "budgets, endpoints, dependencies, imports to new packages, or optimization machinery. "
+        "Native source files, when supplied, are independently built and tested with a locked compiler and dependencies. "
+        "Preserve cancellation and release held inputs in finally blocks. Required combat gates and tests are immutable. "
         "Do not increase retry limits merely to hide a failure. This is a proposal, not proof of improvement.\n"
         + json.dumps(context, ensure_ascii=False))
     atomic_json(output / "context.json", context)
@@ -149,14 +172,14 @@ def invoke(context, output, executable, *, stop_path, timeout=600, model=None, p
 def replacements_from(proposal, context):
     if (not isinstance(proposal, dict) or set(proposal) != set(SCHEMA["required"])
             or not all(isinstance(proposal[k], str) for k in ("summary", "hypothesis"))
-            or not isinstance(proposal["changes"], list) or len(proposal["changes"]) > len(EDITABLE)):
+            or not isinstance(proposal["changes"], list) or len(proposal["changes"]) > len(PROPOSAL_PATHS)):
         raise ValueError("invalid Codex proposal")
     replacements = {}
     for change in proposal["changes"]:
         if not isinstance(change, dict) or set(change) != {"path", "before_sha256", "content"}:
             raise ValueError("invalid code replacement")
         name = change["path"]
-        if (name not in EDITABLE or name in replacements
+        if (name not in PROPOSAL_PATHS or name not in context["sources"] or name in replacements
                 or change["before_sha256"] != context["sources"][name]["sha256"]
                 or not isinstance(change["content"], str) or not 1 <= len(change["content"]) <= 60000):
             raise ValueError("unbound, duplicate or forbidden code change")
@@ -180,6 +203,8 @@ def build_rejections(store):
             continue
         proposal = json.loads(proposal_path.read_bytes())
         log_path = output / "program-build/validation.log"
+        if report.get("evidence_origin") == "offline_native_regression":
+            log_path = output / "native-build/validation.log"
         results.append({"job": job["id"], "parent_program": job.get("parent_program"),
             "proposal_hash": canonical_hash(proposal.get("changes", [])),
             "summary": proposal.get("summary", ""), "status": "build_rejected",
@@ -216,8 +241,8 @@ def optimize(service, job, *, proposer=None):
             return {"status": "replay_rejected", "reason": "repeated_failed_code_proposal", "eligible_for_client_release": False}
         patch = "".join("".join(difflib.unified_diff(
             context["sources"][name]["content"].splitlines(keepends=True), content.splitlines(keepends=True),
-            fromfile="a/" + (name if name == ADAPTER else "platform/src/startlux/" + name),
-            tofile="b/" + (name if name == ADAPTER else "platform/src/startlux/" + name)))
+            fromfile="a/" + (name if name == ADAPTER or name in NATIVE_EDITABLE else "platform/src/startlux/" + name),
+            tofile="b/" + (name if name == ADAPTER or name in NATIVE_EDITABLE else "platform/src/startlux/" + name)))
             for name, content in sorted(replacements.items()))
         (output / "candidate.patch").write_text(patch, encoding="utf-8", newline="")
         if (store.root / "stop.json").exists():
@@ -228,7 +253,7 @@ def optimize(service, job, *, proposer=None):
             rejected = store.bundle(record["candidate_hash"])
             if rejected.program:
                 before, after = programs.verify(rejected.program), programs.verify(program)
-                if all(before[k] == after[k] for k in ("files", "resources")):
+                if all(before.get(k) == after.get(k) for k in ("files", "resources", "native_program")):
                     return {"status": "replay_rejected", "reason": "previously_rejected_program_bytes",
                             "program": program, "eligible_for_client_release": False}
         candidate = Bundle(policy=parent.policy, parent=parent.identity, combat=parent.combat,
@@ -236,6 +261,8 @@ def optimize(service, job, *, proposer=None):
         atomic_json(output / "candidate.json", candidate.model_dump())
         atomic_json(output / "lineage.json", {"parent_bundle": parent.identity,
             "parent_program": context["parent_program"], "candidate_bundle": candidate.identity,
+            "parent_native_program": context.get("parent_native_program"),
+            "candidate_native_program": programs.verify(program).get("native_program"),
             "candidate_program": program, "patch_sha256": sha((output / "candidate.patch").read_bytes()),
             "origin": "codex_exec", "eligible_for_client_release": False})
         return {"status": "candidate_ready", "candidate_hash": candidate.identity, "program": program,

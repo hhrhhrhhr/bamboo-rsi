@@ -1,10 +1,10 @@
-"""Content-addressed Python/JS programs, separate from the trusted RSI controller.
+"""Content-addressed Python/JS/native programs with an independent controller.
 
 Candidates may change the Genshin Decision adapter, checkpoint runner and recovery
-policy plus the JS execute branch. Evidence, gates, credentials, native binaries
-and the controller are sealed.
+policy, the JS execute branch and selected native input handlers. Evidence,
+gates, credentials and the controller are sealed; native binaries are rebuilt.
 This boundary prevents changing the acceptance criteria; it is not an OS sandbox
-for executing arbitrary hostile Python. Native-code optimization is not enabled.
+for executing arbitrary hostile code.
 """
 from __future__ import annotations
 
@@ -22,14 +22,16 @@ import tempfile
 from ...core.contracts import canonical_hash
 from ...core.storage import atomic_json
 from .episode import ExecutionLease, utc_now
+from .rsi_native import EDITABLE as NATIVE_EDITABLE, NativeStore
 
 
 ADAPTER = "integrations/auto_commission/agent-main.js"
 EDITABLE = frozenset({"scenarios/genshin/decision.py", "scenarios/genshin/runner.py",
                       "scenarios/genshin/supervisor.py", ADAPTER})
 CHECKS = ("test_genshin_autonomy.py", "test_genshin_checkpoint.py",
-          "test_genshin_thinking.py", "test_genshin_recording.py", "test_genshin_rsi.py")
-BUILD_VERSION = 2
+          "test_genshin_thinking.py", "test_genshin_recording.py", "test_genshin_rsi.py",
+          "test_genshin_program.py", "test_genshin_native.py")
+BUILD_VERSION = 3
 
 
 def execution_block(source):
@@ -128,7 +130,7 @@ class ProgramStore:
     def verify(self, identity, *, expected_control=None, check_dependencies=True):
         directory = self.directory(identity)
         manifest = json.loads((directory / "manifest.json").read_bytes())
-        if canonical_hash(manifest) != identity or manifest.get("schema_version") != BUILD_VERSION:
+        if canonical_hash(manifest) != identity or manifest.get("schema_version") not in (2, BUILD_VERSION):
             raise ValueError("program manifest changed")
         files = source_files(directory / "src/startlux", sealed=True)
         if ({k: sha(v) for k, v in files.items()} != manifest["files"]
@@ -149,6 +151,7 @@ class ProgramStore:
         if (len(entries) != 1 or entries[0].name != "agent-main.js" or entries[0].is_symlink()
                 or sha(entries[0].read_bytes()) != manifest["resources"].get("agent-main.js")):
             raise ValueError("program execution resources changed")
+        native = NativeStore(self.home).verify(manifest["native_program"]) if manifest.get("native_program") else None
         if manifest["parent"]:
             parent_dir = self.directory(manifest["parent"])
             parent = json.loads((parent_dir / "manifest.json").read_bytes())
@@ -160,7 +163,11 @@ class ProgramStore:
                 changed.add(ADAPTER)
                 validate_adapter((parent_dir / "resources/agent-main.js").read_text(encoding="utf-8"),
                                  entries[0].read_text(encoding="utf-8"))
-            if (not changed or not changed <= EDITABLE or sorted(changed) != manifest["changed_files"]
+            if parent.get("native_program") != manifest.get("native_program"):
+                if not native or native["parent"] != parent.get("native_program") or not parent.get("native_program"):
+                    raise ValueError("native candidate did not inherit the accepted parent")
+                changed.update(native["changed_files"])
+            if (not changed or not changed <= EDITABLE | NATIVE_EDITABLE or sorted(changed) != manifest["changed_files"]
                     or parent["control_sha256"] != manifest["control_sha256"]
                     or parent["dependencies"] != manifest["dependencies"]
                     or parent["evaluator_sha256"] != manifest["evaluator_sha256"]):
@@ -184,10 +191,19 @@ class ProgramStore:
         else:
             files = source_files(root / "platform/src/startlux")
             adapter = (root / ADAPTER).read_bytes()
+        native = before.get("native_program") if parent else None
+        if not parent and (self.home / "rsi/native-baseline.json").exists():
+            native = json.loads((self.home / "rsi/native-baseline.json").read_bytes())["native_program"]
         changes = []
+        native_replacements = {}
         for name, content in (replacements or {}).items():
-            if name not in EDITABLE or not isinstance(content, str) or not 1 <= len(content) <= 60000:
+            if name not in EDITABLE | NATIVE_EDITABLE or not isinstance(content, str) or not 1 <= len(content) <= 60000:
                 raise ValueError("code proposal is outside the allowed surface")
+            if name in NATIVE_EDITABLE:
+                if not native:
+                    raise ValueError("native optimization requires a frozen baseline")
+                native_replacements[name] = content
+                continue
             raw = content.encode("utf-8")
             if name == ADAPTER:
                 validate_adapter(adapter.decode("utf-8"), content)
@@ -198,6 +214,11 @@ class ProgramStore:
             if raw != files[name]:
                 files[name] = raw
                 changes.append(name)
+        if native_replacements:
+            options = json.loads((self.home / "rsi/native-baseline.json").read_bytes())
+            native = NativeStore(self.home).build(output, parent=native, replacements=native_replacements,
+                                                  dotnet=options["dotnet"])
+            changes.extend(NativeStore(self.home).verify(native)["changed_files"])
         if parent and not changes:
             raise ValueError("program candidate made no code change")
         for name, raw in files.items():
@@ -241,7 +262,7 @@ class ProgramStore:
         manifest = {"schema_version": BUILD_VERSION, "parent": parent, "runtime_sha256": frozen,
                     "control_sha256": control_hash(files), "evaluator_sha256": evaluation,
                     "dependencies": dependencies(), "files": {k: sha(v) for k, v in files.items()},
-                    "resources": {"agent-main.js": sha(adapter)},
+                    "resources": {"agent-main.js": sha(adapter)}, "native_program": native,
                     "changed_files": sorted(changes), "validation": report}
         identity = canonical_hash(manifest)
         atomic_json(destination / "manifest.json", manifest)

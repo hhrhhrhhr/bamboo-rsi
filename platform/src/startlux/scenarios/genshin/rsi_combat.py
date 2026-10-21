@@ -61,7 +61,7 @@ class CombatLease:
         self.audit_path.with_suffix(".backup").write_bytes(original)
         atomic_json(self.audit_path, {"status": "installing", "before_sha256": self.patch.before_sha256,
                                     "after_sha256": hashlib.sha256(self.patch.script.encode()).hexdigest(),
-                                    "relative_path": self.patch.relative_path})
+                                    "relative_path": self.patch.relative_path, "host_directory": str(self.host)})
         self.path.write_bytes(self.patch.script.encode("utf-8"))
         return self
 
@@ -90,8 +90,13 @@ def recover_combat(home, host):
             raise RuntimeError("combat recovery requires an acknowledged stopped input lease")
         if value["relative_path"] != "User/AutoFight/StartLux/bennett-ayaka-yelan-zhongli.txt":
             raise ValueError("invalid combat recovery path")
-        path = host / value["relative_path"]
-        if path.is_symlink() or not path.resolve().is_relative_to(host):
+        owned_host = Path(value.get("host_directory", host)).resolve()
+        isolated_root = (Path(home) / "rsi/native-hosts").resolve()
+        if owned_host != host and (not owned_host.is_relative_to(isolated_root)
+                or owned_host.parent != isolated_root or owned_host.is_symlink()):
+            raise ValueError("combat recovery host is not an owned native directory")
+        path = owned_host / value["relative_path"]
+        if path.is_symlink() or not path.resolve().is_relative_to(owned_host):
             raise ValueError("combat recovery escapes host")
         original = audit.with_suffix(".backup").read_bytes()
         if hashlib.sha256(original).hexdigest() != value["before_sha256"]:

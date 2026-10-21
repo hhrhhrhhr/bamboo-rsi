@@ -77,10 +77,15 @@ class Campaign(Contract):
     programs: dict[str, str] = Field(default_factory=dict)
     runtime_by_bundle: dict[str, str] = Field(default_factory=dict)
     evaluator_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    native_by_bundle: dict[str, str] = Field(default_factory=dict)
+    build_by_bundle: dict[str, dict[str, str]] = Field(default_factory=dict)
 
     @model_serializer(mode="wrap")
     def preserve_historical_identity(self, serialize):
         value = serialize(self)
+        if not self.native_by_bundle and not self.build_by_bundle:
+            value.pop("native_by_bundle")
+            value.pop("build_by_bundle")
         if not self.programs and not self.runtime_by_bundle and self.evaluator_sha256 is None:
             for key in ("programs", "runtime_by_bundle", "evaluator_sha256"):
                 value.pop(key)
@@ -88,6 +93,9 @@ class Campaign(Contract):
 
     def expected_runtime(self, bundle):
         return self.runtime_by_bundle.get(bundle, self.runtime_sha256)
+
+    def expected_build(self, bundle):
+        return self.build_by_bundle.get(bundle, self.execution_build)
 
     @model_validator(mode="after")
     def validate_design(self):
@@ -115,6 +123,16 @@ class Campaign(Contract):
                 raise ValueError("code campaign must bind both program arms and the evaluator")
             for value in [*self.programs.values(), *self.runtime_by_bundle.values()]:
                 valid_id(value)
+        if self.native_by_bundle or self.build_by_bundle:
+            from .rsi_program import valid_id
+            if (set(self.native_by_bundle) != {self.parent, self.candidate}
+                    or set(self.build_by_bundle) != set(self.native_by_bundle)
+                    or set(self.programs) != set(self.native_by_bundle)):
+                raise ValueError("native campaign must bind both native program arms")
+            for arm, value in self.native_by_bundle.items():
+                valid_id(value)
+                if not self.build_by_bundle[arm].get("BetterGI.dll"):
+                    raise ValueError("native campaign requires both compiled builds")
         return self
 
     @property
@@ -140,6 +158,8 @@ def evaluate_campaign(plan, rows):
         if plan.programs and (row.get("program") != plan.programs[assigned]
                 or row.get("evaluator_sha256") != plan.evaluator_sha256):
             reasons.append("program_or_evaluator_changed")
+        if plan.native_by_bundle and row.get("native_program") != plan.native_by_bundle[assigned]:
+            reasons.append("native_program_changed")
         arms[assigned].append(row)
     baseline, candidate = arms[plan.parent], arms[plan.candidate]
     if any(row.get("success") is not True for row in candidate):
@@ -311,6 +331,13 @@ class RSIStore:
                 code = {"programs": {parent.identity: parent_program, candidate.identity: candidate_program},
                         "runtime_by_bundle": {parent.identity: before["runtime_sha256"], candidate.identity: after["runtime_sha256"]},
                         "evaluator_sha256": before["evaluator_sha256"]}
+                if before.get("native_program") or after.get("native_program"):
+                    from .rsi_native import program_build
+                    if not before.get("native_program") or not after.get("native_program"):
+                        raise ValueError("native comparison requires both frozen native arms")
+                    code.update(native_by_bundle={parent.identity: before["native_program"], candidate.identity: after["native_program"]},
+                                build_by_bundle={parent.identity: program_build(self.home, before, execution_build),
+                                                 candidate.identity: program_build(self.home, after, execution_build)})
             schedule = {(start + timedelta(days=i)).isoformat(): (parent.identity if i % 2 == 0 else candidate.identity)
                         for i in range(14)}
             plan = Campaign(account_id=account_id, server_id=server_id, base_hash=parent.policy.base_hash,

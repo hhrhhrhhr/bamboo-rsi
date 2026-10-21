@@ -89,11 +89,12 @@ def terminate_worker(worker):
     worker.wait(timeout=5)
 
 
-def archive_native_diagnostics(install, run, host_pid):
+def archive_native_diagnostics(install, run, host_pid, *, host_directory=None):
     """Archive only this owned host's log blocks; not another BetterGI session."""
     run = Path(run)
     blocks = []
-    for path in sorted((Path(install) / "bettergi/log").glob("*" + run.name[:8] + "*.log")):
+    directory = Path(host_directory) if host_directory else Path(install) / "bettergi"
+    for path in sorted((directory / "log").glob("*" + run.name[:8] + "*.log")):
         for block in re.split(r"\r?\n\r?\n", path.read_text(encoding="utf-8-sig").strip()):
             if f":P{host_pid}:" in block:
                 blocks.append(block)
@@ -156,6 +157,8 @@ def main():
     watcher = None
     assets = None
     run_directory = None
+    host_directory = install / "bettergi"
+    native_program = None
     started_ns = time.time_ns()
     write_state("starting", pipe=pipe, controller_pid=os.getpid())
     try:
@@ -172,6 +175,7 @@ def main():
             identity = bundle_program(home, bundle)
             programs = ProgramStore(home)
             manifest = programs.verify(identity)
+            native_program = manifest.get("native_program")
             if manifest["evaluator_sha256"] != evaluator_hash(ROOT):
                 raise ValueError("independent program evaluator changed")
             entry = [sys.executable, "-I", "-B", str(ROOT / "scripts/genshin_program_entry.py"),
@@ -184,6 +188,11 @@ def main():
         if b'"BetterGI.exe"' in processes:
             write_state("bettergi_already_running")
             return 6
+        if native_program:
+            from startlux.scenarios.genshin.rsi_native import NativeStore
+            # Unique private host; failures retain this directory for diagnosis.
+            host_directory = NativeStore(home).prepare_host(native_program, host_directory,
+                home / "rsi/native-hosts" / (str(started_ns) + "-" + native_program[:12]))
         key = read_credential(home / "credential.dpapi")
         # Keep the historical policy identity separate from the assigned program.
         assets = tempfile.TemporaryDirectory(prefix="task-source-", dir=RUNTIME)
@@ -193,7 +202,7 @@ def main():
                 (RUNTIME / "live-worker-stderr.log").open("w", encoding="utf-8") as stderr:
             worker = subprocess.Popen([*entry, "run",
                 "--config", str(config_path), "--pipe", pipe, "--assets", str(assets_path),
-                "--host-directory", str(install / "bettergi"), "--run-mode", args.run_mode,
+                "--host-directory", str(host_directory), "--run-mode", args.run_mode,
                 *(["--rsi-rehearsal", args.rsi_rehearsal] if args.rsi_rehearsal else [])],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr, encoding="utf-8", cwd=ROOT,
                 creationflags=subprocess.CREATE_NO_WINDOW)
@@ -230,8 +239,8 @@ def main():
                     environment = os.environ.copy()
                     environment["STARTLUX_AGENT_CONFIG"] = event["bridge_config"]
                     environment["STARTLUX_AGENT_PIPE"] = pipe
-                    host = subprocess.Popen([str(install / "bettergi/BetterGI.exe")],
-                        env=environment, cwd=install / "bettergi")
+                    host = subprocess.Popen([str(host_directory / "BetterGI.exe")],
+                        env=environment, cwd=host_directory)
                     worker.stdin.write("host_started\n")
                     worker.stdin.flush()
                 write_state("running" if event.get("status") == "progress" else event.get("status", "unknown"),
@@ -273,7 +282,7 @@ def main():
                 host.terminate()
             if run_directory:
                 try:
-                    archive_native_diagnostics(install, run_directory, host.pid)
+                    archive_native_diagnostics(install, run_directory, host.pid, host_directory=host_directory)
                 except (OSError, UnicodeError):
                     pass  # Diagnostic collection must not prevent releasing owned inputs.
         if worker is not None and worker.poll() is None:

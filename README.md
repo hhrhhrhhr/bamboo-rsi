@@ -43,12 +43,22 @@ platform/.venv/Scripts/python.exe -m startlux.cli rsi-genshin enable-codex --hom
 
 启用命令在服务锁或输入未释放时拒绝执行，建立基线程序快照并实际运行独立回归。随后通过 `Start-Genshin-RSI-Admin.lnk` 或以管理员身份运行 `Start-Genshin-RSI.cmd` 启动。已登记的实机对照期间不能更换后端或评测器。源码、测试、依赖变动会使冻结校验失败，需要先停止运行并做有记录的迁移。
 
-- 第一版可修改 `decision.py`（Decision 适配）、`runner.py`（执行检查点）、`supervisor.py`（恢复策略），以及 `agent-main.js` 中单独划定的委托执行分支。JS 的任务识别、委托簿证据与奖励核验代码保持冻结；BetterGI 原生二进制、上游资源、凭据读取、录像、账号校验和晋级规则不在自动修改范围内。
+- 可修改 `decision.py`（Decision 适配）、`runner.py`（执行检查点）、`supervisor.py`（恢复策略），以及 `agent-main.js` 中单独划定的委托执行分支。JS 的任务识别、委托簿证据与奖励核验代码保持冻结。显式启用原生版本管理后，还可提出 `AgentFlightInput.cs`、`StopFlyingHandler.cs`、`CombatScriptHandler.cs` 的补丁；必须清怪的路径门控、凭据读取、录像、账号校验和晋级规则保持冻结。
 - Codex 以只读模式接收经过裁剪和脱敏的历史失败及允许修改的源码，返回完整文件内容与原文件哈希。项目保存结构化提案、统一补丁、调用回执、用量和独立构建结果；失败和中断也消耗持久预算，默认总计最多 8 次调用，每次最多 600 秒。
 - 完整 Python 源码、JS 执行适配器和依赖版本被冻结到私有 `rsi/programs/<hash>/`。候选继承父程序，必须通过独立 Python 回归及 Node.js 执行边界测试；启动器从该目录载入源码，在输入前核对程序和任务资源哈希。
 - 14 天对照为两个实验组分别固定程序哈希与运行哈希，评测器哈希保持一致。通过真实证据晋级后，下一轮提案读取已接受的程序；回滚恢复上一代程序。开发试跑、离线回归和 Codex 自报成功都不能触发实机晋级。
 
-候选修改范围与哈希检查是工程边界，不是执行恶意 Python 的操作系统安全沙箱；本地实机工作流只运行可信项目产生且通过审核边界的代码。候选程序、提案、日志及运行证据都留在被 Git 忽略的本机运行目录。
+原生版本管理需要 Windows .NET 8 SDK 和已经应用仓库桥接补丁的 BetterGI 源码。只在尚未晋级且没有活动对照试验时迁移：
+
+```powershell
+platform/.venv/Scripts/python.exe -m startlux.cli rsi-genshin stop --home .runtime/genshin-home
+platform/.venv/Scripts/python.exe -m startlux.cli rsi-genshin enable-native --home .runtime/genshin-home --native-source .runtime/bettergi --dotnet .runtime/dotnet/dotnet.exe
+platform/.venv/Scripts/python.exe -m startlux.cli rsi-genshin enable-codex --home .runtime/genshin-home --root . --refresh-program-baseline
+```
+
+原生构建冻结完整源码、固定测试、NuGet 锁文件和 SDK 标识。每个候选运行原生测试及两次独立目录的干净编译，要求发布文件逐字节一致，依赖保持不变。产物存入私有 `rsi/native-programs/<hash>/`，失败构建完整保留。每次实机运行复制独立的 `rsi/native-hosts/`，只带入本机游戏配置和战斗脚本，在游戏输入前核对实际目录；不覆盖正在运行或已安装的 BetterGI。父版本、候选和下一代程序各自绑定原生产物，回滚选择父版本产物。该流程仍需实机前瞻对照证明改善，编译通过不能证明飞行或任务已修好。
+
+候选修改范围与哈希检查是工程边界，不是执行恶意 Python/C# 的操作系统安全沙箱；本地实机工作流只运行可信项目产生且通过审核边界的代码。候选程序、提案、日志及运行证据都留在被 Git 忽略的本机运行目录。
 
 ## 构建 Windows 客户端
 

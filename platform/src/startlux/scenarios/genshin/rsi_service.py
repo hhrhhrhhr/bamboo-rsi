@@ -286,6 +286,8 @@ class Coordinator:
             "rejected_hypotheses": sorted({record["candidate_hash"] for record in rejections})}
         if backend == "codex_exec":
             problem["code_build_rejections"] = sorted({r["proposal_hash"] for r in code_failures})
+            from .rsi_program import bundle_program
+            problem["parent_program"] = bundle_program(self.store.home, active)
         problem_hash = canonical_hash(problem)
         days = sorted(groups)
         exposed = set()

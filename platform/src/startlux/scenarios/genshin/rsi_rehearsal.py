@@ -165,6 +165,13 @@ def pending_rehearsal(service, scope, now):
             valid = (valid and not issues and len(bindings) == 1 and bool(armed)
                      and bindings[0][0] < min(armed) and bindings[0][1].get("program") == candidate.program
                      and metadata.get("runtime_sha256") == manifest["runtime_sha256"])
+            from .rsi_native import binding_verified, program_build
+            expected_build = program_build(store.home, manifest, service.config["execution_build"])
+            if candidate.combat:
+                import hashlib
+                expected_build[candidate.combat.relative_path] = hashlib.sha256(candidate.combat.script.encode()).hexdigest()
+            if manifest.get("native_program"):
+                valid = valid and binding_verified(store.home, manifest, records, metadata) and metadata.get("execution_build") == expected_build
         from .rsi_route import route_binding_verified
         if valid and candidate.route is not None:
             valid = route_binding_verified(run, candidate)

@@ -328,6 +328,8 @@ def execute_run(args, config):
             bundle = store.bundle(policy_event["rsi"]["bundle_hash"])
             from .rsi_program import verify_running_program, bind_resources
             verify_running_program(home, bundle, audit)
+            from .rsi_native import bind_native
+            bind_native(home, bundle, host_directory, audit)
             pack = bind_resources(pack, home, bundle, audit)
             route_policy = bundle.route or TimedRoutePolicy()
             route_bundle_hash = bundle.identity
@@ -339,7 +341,7 @@ def execute_run(args, config):
             if enrollment:
                 plan = store.plan(enrollment["campaign_hash"])
                 if (audit.value["runtime_sha256"] != plan.expected_runtime(bundle.identity)
-                        or execution_build(host_directory) != plan.execution_build or args.run_mode != "autonomous"):
+                        or execution_build(host_directory) != plan.expected_build(bundle.identity) or args.run_mode != "autonomous"):
                     raise ValueError("campaign runtime or autonomous mode changed")
                 store.consume(enrollment, run.name)
             audit({"type": "rsi_assignment", "bundle_hash": bundle.identity,
