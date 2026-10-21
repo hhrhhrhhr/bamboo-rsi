@@ -22,7 +22,7 @@ from .rsi_route import TimedRoutePolicy
 
 
 class CombatPatch(Contract):
-    """The only executable self-repair surface: BetterGI's bounded combat DSL."""
+    """BetterGI's bounded combat DSL; program candidates are versioned separately."""
     relative_path: str = "User/AutoFight/StartLux/bennett-ayaka-yelan-zhongli.txt"
     before_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     script: str = Field(min_length=1, max_length=6000)
@@ -41,12 +41,15 @@ class Bundle(Contract):
     parent: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     combat: CombatPatch | None = None
     route: TimedRoutePolicy | None = None
+    program: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
     @model_serializer(mode="wrap")
     def preserve_historical_identity(self, serialize):
         value = serialize(self)
         if self.route is None:
             value.pop("route", None)
+        if self.program is None:
+            value.pop("program", None)
         return value
 
     @property
@@ -71,6 +74,20 @@ class Campaign(Contract):
     cost_improvement_ratio: float = Field(default=0.9, gt=0, le=0.9)
     duration_regression_ratio: float = Field(default=1.1, ge=1, le=1.1)
     duration_improvement_ratio: float = Field(default=0.9, gt=0, le=0.9)
+    programs: dict[str, str] = Field(default_factory=dict)
+    runtime_by_bundle: dict[str, str] = Field(default_factory=dict)
+    evaluator_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+    @model_serializer(mode="wrap")
+    def preserve_historical_identity(self, serialize):
+        value = serialize(self)
+        if not self.programs and not self.runtime_by_bundle and self.evaluator_sha256 is None:
+            for key in ("programs", "runtime_by_bundle", "evaluator_sha256"):
+                value.pop(key)
+        return value
+
+    def expected_runtime(self, bundle):
+        return self.runtime_by_bundle.get(bundle, self.runtime_sha256)
 
     @model_validator(mode="after")
     def validate_design(self):
@@ -91,6 +108,13 @@ class Campaign(Contract):
             raise ValueError("training days cannot enter prospective evaluation")
         if not self.execution_build.get("BetterGI.dll"):
             raise ValueError("campaign requires a frozen native build")
+        if self.programs or self.runtime_by_bundle or self.evaluator_sha256:
+            from .rsi_program import valid_id
+            if (set(self.programs) != {self.parent, self.candidate}
+                    or set(self.runtime_by_bundle) != set(self.programs) or not self.evaluator_sha256):
+                raise ValueError("code campaign must bind both program arms and the evaluator")
+            for value in [*self.programs.values(), *self.runtime_by_bundle.values()]:
+                valid_id(value)
         return self
 
     @property
@@ -111,8 +135,11 @@ def evaluate_campaign(plan, rows):
         if (row.get("verified") is not True or row.get("bundle_hash") != assigned
                 or row.get("game_day") != day or row.get("campaign_hash") != plan.identity):
             reasons.append("unverified_or_unbound_day")
-        if row.get("runtime_sha256") != plan.runtime_sha256:
+        if row.get("runtime_sha256") != plan.expected_runtime(assigned):
             reasons.append("runtime_changed")
+        if plan.programs and (row.get("program") != plan.programs[assigned]
+                or row.get("evaluator_sha256") != plan.evaluator_sha256):
+            reasons.append("program_or_evaluator_changed")
         arms[assigned].append(row)
     baseline, candidate = arms[plan.parent], arms[plan.candidate]
     if any(row.get("success") is not True for row in candidate):
@@ -256,7 +283,8 @@ class RSIStore:
                 raise ValueError("candidate must descend from the current active bundle")
             if (candidate.policy.base_hash, candidate.policy.model) != (parent.policy.base_hash, parent.policy.model):
                 raise ValueError("candidate changed fixed execution resources or Decision model")
-            if candidate.policy == parent.policy and candidate.combat == parent.combat:
+            if (candidate.policy == parent.policy and candidate.combat == parent.combat
+                    and candidate.route == parent.route and candidate.program == parent.program):
                 raise ValueError("candidate made no change")
             if candidate.combat and execution_build.get(candidate.combat.relative_path) != candidate.combat.before_sha256:
                 raise ValueError("combat patch is not based on the installed baseline")
@@ -268,13 +296,28 @@ class RSIStore:
             if start < now.date():
                 raise ValueError("prospective campaigns cannot be backdated")
             self.put_bundle(candidate)
+            code = {}
+            from .rsi_program import ProgramStore, bundle_program
+            programs = ProgramStore(self.home)
+            parent_program, candidate_program = (bundle_program(self.home, b) for b in (parent, candidate))
+            if parent_program or candidate_program:
+                if not parent_program or not candidate_program:
+                    raise ValueError("code campaign needs a reproducible baseline program")
+                before, after = (programs.verify(p) for p in (parent_program, candidate_program))
+                if (before["control_sha256"] != after["control_sha256"]
+                        or before["evaluator_sha256"] != after["evaluator_sha256"]
+                        or (candidate_program != parent_program and after["parent"] != parent_program)):
+                    raise ValueError("candidate code did not inherit the accepted parent/evaluator")
+                code = {"programs": {parent.identity: parent_program, candidate.identity: candidate_program},
+                        "runtime_by_bundle": {parent.identity: before["runtime_sha256"], candidate.identity: after["runtime_sha256"]},
+                        "evaluator_sha256": before["evaluator_sha256"]}
             schedule = {(start + timedelta(days=i)).isoformat(): (parent.identity if i % 2 == 0 else candidate.identity)
                         for i in range(14)}
             plan = Campaign(account_id=account_id, server_id=server_id, base_hash=parent.policy.base_hash,
                             server_utc_offset_minutes=server_utc_offset_minutes,
                             parent=parent.identity, candidate=candidate.identity, created_at=now.isoformat(),
                             runtime_sha256=runtime_sha256, execution_build=execution_build,
-                            assignments=schedule, training_days=sorted(set(training_days)))
+                            assignments=schedule, training_days=sorted(set(training_days)), **code)
             atomic_json(self.root / "campaigns" / plan.identity / "plan.json", plan.model_dump())
             pointer["campaign_hash"] = plan.identity
             atomic_json(self.root / "active.json", pointer)

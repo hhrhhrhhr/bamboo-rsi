@@ -139,6 +139,21 @@ def main():
     try:
         config_path = home / "settings.json"
         configured_model(json.loads(config_path.read_text(encoding="utf-8-sig")))
+        entry = [sys.executable, str(ROOT / "scripts/genshin_desktop_entry.py")]
+        if (home / "rsi/program-baseline.json").exists():
+            from startlux.scenarios.genshin.episode import configured_scope
+            from startlux.scenarios.genshin.rsi import RSIStore
+            from startlux.scenarios.genshin.rsi_program import ProgramStore, bundle_program, evaluator_hash
+            store = RSIStore(home)
+            config = json.loads(config_path.read_text(encoding="utf-8-sig"))
+            bundle = store.bundle(args.rsi_rehearsal) if args.rsi_rehearsal else store.assignment(configured_scope(config))[0]
+            identity = bundle_program(home, bundle)
+            programs = ProgramStore(home)
+            manifest = programs.verify(identity)
+            if manifest["evaluator_sha256"] != evaluator_hash(ROOT):
+                raise ValueError("independent program evaluator changed")
+            entry = [sys.executable, "-I", "-B", str(ROOT / "scripts/genshin_program_entry.py"),
+                     str(programs.directory(identity))]
         if not (install / "bettergi/BetterGI.exe").is_file():
             raise FileNotFoundError("InstalledBetterGIUnavailable")
         # Keep an unrelated BetterGI session out of this development input lease.
@@ -155,7 +170,7 @@ def main():
         shutil.copyfile(ROOT / "integrations/auto_commission/agent-main.js", assets_path / "agent-main.js")
         with (RUNTIME / "live-events.jsonl").open("a", encoding="utf-8", buffering=1) as log, \
                 (RUNTIME / "live-worker-stderr.log").open("w", encoding="utf-8") as stderr:
-            worker = subprocess.Popen([sys.executable, str(ROOT / "scripts/genshin_desktop_entry.py"), "run",
+            worker = subprocess.Popen([*entry, "run",
                 "--config", str(config_path), "--pipe", pipe, "--assets", str(assets_path),
                 "--host-directory", str(install / "bettergi"), "--run-mode", args.run_mode,
                 *(["--rsi-rehearsal", args.rsi_rehearsal] if args.rsi_rehearsal else [])],

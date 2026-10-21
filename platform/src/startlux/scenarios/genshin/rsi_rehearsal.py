@@ -63,6 +63,15 @@ def queue_candidate(service, candidate, result, job):
     active = service.store.active(service.base)
     if candidate.parent != active.identity or candidate.identity != result["candidate_hash"]:
         raise ValueError("unbound rehearsal candidate")
+    if candidate.program:
+        from .rsi_program import ProgramStore, bundle_program
+        programs = ProgramStore(service.store.home)
+        parent_program = bundle_program(service.store.home, active)
+        before = programs.verify(parent_program)
+        after = programs.verify(candidate.program, expected_control=before["control_sha256"])
+        if (candidate.program != parent_program and after["parent"] != parent_program
+                or after["evaluator_sha256"] != before["evaluator_sha256"]):
+            raise ValueError("rehearsal code did not inherit the accepted parent")
     if candidate.combat and candidate.combat != active.combat:
         service.native_validator(candidate.combat, Path(job["windows_output"]))
     service.store.put_bundle(candidate)
@@ -147,6 +156,15 @@ def pending_rehearsal(service, scope, now):
                  metadata.get("policy", {}).get("rsi", {}).get("rehearsal") is True and
                  metadata.get("rsi_assignment", {}).get("bundle_hash") == candidate.identity)
         assessment = assess_run(run)
+        if candidate.program:
+            from .rsi_program import ProgramStore
+            manifest = ProgramStore(store.home).verify(candidate.program)
+            records, issues = read_records(run)
+            bindings = [(n, e) for n, e in records if e.get("type") == "program_bound"]
+            armed = [n for n, e in records if e.get("type") == "execution_arming"]
+            valid = (valid and not issues and len(bindings) == 1 and bool(armed)
+                     and bindings[0][0] < min(armed) and bindings[0][1].get("program") == candidate.program
+                     and metadata.get("runtime_sha256") == manifest["runtime_sha256"])
         from .rsi_route import route_binding_verified
         if valid and candidate.route is not None:
             valid = route_binding_verified(run, candidate)

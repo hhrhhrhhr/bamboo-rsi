@@ -143,7 +143,7 @@ def run(job, key):
         return {"status": "blocked_quota", "blocked_services": blocked_services(output), "eligible_for_client_release": False}
     if report["workflow"]["failed"]:
         return {"status": "optimizer_failed", "eligible_for_client_release": False}
-    candidate = Bundle(policy=policy, parent=parent.identity, combat=patch, route=route)
+    candidate = Bundle(policy=policy, parent=parent.identity, combat=patch, route=route, program=parent.program)
     # Selection is frozen before any heldout model calls. Labels never enter the proposer context.
     atomic_json(output / "candidate.json", candidate.model_dump())
     rows = {"baseline": [], "candidate": []}

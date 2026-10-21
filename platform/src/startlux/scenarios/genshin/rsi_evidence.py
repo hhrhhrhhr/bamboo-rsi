@@ -1,6 +1,7 @@
 """Recompute prospective outcomes from the original enrolled Windows trace."""
 from datetime import datetime
 from pathlib import Path
+import hashlib
 import json
 import re
 
@@ -60,7 +61,9 @@ def verify_enrolled_day(home, plan, enrollment):
         baseline_build = metadata.get("execution_build", {})
         from .taskpack import TaskPack
         pack = TaskPack.load(run / "pack")
-        if pack.policy_base_hash != plan.base_hash or pack.instructions != bundle.policy.instructions:
+        from .rsi_program import normalized_pack_hash
+        pack_base = normalized_pack_hash(pack, home, bundle) if plan.programs else pack.policy_base_hash
+        if pack_base != plan.base_hash or pack.instructions != bundle.policy.instructions:
             raise ValueError("executed pack differs from assigned policy")
         supported = json.loads((pack.root / "autocommission/name.json").read_text(encoding="utf-8-sig"))
         quest_types = []
@@ -73,10 +76,28 @@ def verify_enrolled_day(home, plan, enrollment):
         quest_types.sort()
         expected_build = dict(plan.execution_build)
         if bundle.combat:
-            import hashlib
             expected_build[bundle.combat.relative_path] = hashlib.sha256(bundle.combat.script.encode()).hexdigest()
-        if baseline_build != expected_build or assessment["runtime_sha256"] != plan.runtime_sha256:
+        if baseline_build != expected_build or assessment["runtime_sha256"] != plan.expected_runtime(bundle.identity):
             raise ValueError("frozen execution build changed")
+        program_fields = {}
+        if plan.programs:
+            from .rsi_program import ProgramStore, bundle_program
+            identity = plan.programs[bundle.identity]
+            manifest = ProgramStore(home).verify(identity)
+            bindings = [(n, e) for n, e in records if e.get("type") == "program_bound"]
+            resources = [(n, e) for n, e in records if e.get("type") == "program_resources_bound"]
+            arming = [n for n, e in records if e.get("type") == "execution_arming"]
+            if (bundle_program(home, bundle) != identity or len(bindings) != 1 or not arming
+                    or bindings[0][0] >= min(arming) or bindings[0][1].get("program") != identity
+                    or bindings[0][1].get("runtime_sha256") != manifest["runtime_sha256"]
+                    or bindings[0][1].get("control_sha256") != manifest["control_sha256"]
+                    or manifest["evaluator_sha256"] != plan.evaluator_sha256
+                    or len(resources) != 1 or resources[0][0] >= min(arming)
+                    or resources[0][1].get("program") != identity
+                    or resources[0][1].get("resources") != manifest["resources"]
+                    or resources[0][1].get("manifest_sha256") != hashlib.sha256((pack.root / "manifest.json").read_bytes()).hexdigest()):
+                raise ValueError("program build is not bound before game input")
+            program_fields = {"program": identity, "evaluator_sha256": plan.evaluator_sha256}
         start, end = map(datetime.fromisoformat, (metadata["started_at"], metadata["ended_at"]))
         if start.tzinfo is None or end.tzinfo is None or end <= start:
             raise ValueError("invalid run clock")
@@ -88,7 +109,7 @@ def verify_enrolled_day(home, plan, enrollment):
                    stratum="+".join(quest_types) if quest_types else None,
                    evidence_origin="windows_live" if not bundle.policy.model.startswith(("fixture-", "test-")) else "synthetic",
                    run_id=run_id, trace_sha256=assessment["trace_sha256"], assessment_hash=canonical_hash(assessment),
-                   runtime_sha256=assessment["runtime_sha256"], execution_build=baseline_build)
+                   runtime_sha256=assessment["runtime_sha256"], execution_build=baseline_build, **program_fields)
         if not quest_types:
             row.update(verified=False, issues=["task_mix_unknown"])
     except (OSError, ValueError, KeyError, TypeError, AttributeError):

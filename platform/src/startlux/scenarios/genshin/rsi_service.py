@@ -137,6 +137,11 @@ class Coordinator:
                 return state  # Legacy unscoped failures require an explicit probe or retry.
             if self.config["runtime_sha256"] != runtime_identity():
                 return self.status("attention_required", reason="runtime_changed_after_configuration")
+            if (self.store.root / "program-baseline.json").exists():
+                from .rsi_program import ProgramStore, evaluator_hash
+                baseline = ProgramStore(self.store.home).verify(self.store.read("program-baseline.json")["program"])
+                if baseline["evaluator_sha256"] != evaluator_hash(self.config["root"]):
+                    return self.status("attention_required", reason="independent_evaluator_changed")
             from .rsi_combat import recover_combat
             recover_combat(self.store.home, self.config["host"])
             active = self.store.active(self.base)
@@ -163,12 +168,18 @@ class Coordinator:
                         if (metadata.get("state") != "ended" and metadata.get("execution_armed")
                                 and not has_stop_resolution(path)):
                             return self.status("attention_required", reason="prior_input_unresolved", run_id=path.name)
+                        # The successful development rehearsal is intentionally
+                        # ineligible as an autonomous day. It must not trigger
+                        # rollback immediately after this candidate is promoted.
+                        if (metadata.get("run_mode") == "development"
+                                or metadata.get("rsi_assignment", {}).get("campaign_hash")):
+                            continue
                         assessment = assess_run(path)
                         if metadata.get("state") == "ended" and not assessment["autonomy_eligible"]:
                             previous = self.store.rollback(expected_active=active.identity, reason="live_regression")
                             return self.status("rolled_back", bundle_hash=previous["bundle_hash"], run_id=path.name)
             if (not pointer.get("campaign_hash") and pointer["generation"] < self.config["max_generations"]
-                    and (self.config.get("optimizer_backend", "harness2_chat") == "decision_search"
+                    and (self.config.get("optimizer_backend", "harness2_chat") in {"decision_search", "codex_exec"}
                          or providers.get("improver", {}).get("status") != "blocked_quota")):
                 proposal = self.prepare_job(active)
                 if proposal:
@@ -246,7 +257,11 @@ class Coordinator:
             try:
                 pack, cases = captured_cases(run)
                 if pack.policy_base_hash != self.base.base_hash:
-                    continue
+                    from .rsi_program import normalized_pack_hash
+                    metadata = json.loads((run / "attempt.json").read_bytes())
+                    bundle = self.store.bundle(metadata["rsi_assignment"]["bundle_hash"])
+                    if normalized_pack_hash(pack, self.store.home, bundle) != self.base.base_hash:
+                        continue
                 for case in cases:
                     groups.setdefault(case.observation.scope.game_day, {}).setdefault(case.id, case)
                 runs.append(run)
@@ -255,16 +270,22 @@ class Coordinator:
         if not groups:
             return None
         backend = self.config.get("optimizer_backend", "harness2_chat")
-        if backend not in {"harness2_chat", "decision_search"}:
+        if backend not in {"harness2_chat", "decision_search", "codex_exec"}:
             raise ValueError("unknown RSI optimizer backend")
         from .rsi_decision_search import SEARCH_VERSION
         from .rsi_rehearsal import environment, rejection_records
         rejections = list(rejection_records(self.store, self.config))
+        code_failures = []
+        if backend == "codex_exec":
+            from .rsi_codex import build_rejections
+            code_failures = build_rejections(self.store)
         problem = {"parent": active.identity, "captures": {k: sorted(v) for k,v in groups.items()},
             "backend": backend, "search_version": SEARCH_VERSION if backend == "decision_search" else None,
             "environment": environment(self.config),
             "development_training_days": self.config.get("development_training_days", []),
             "rejected_hypotheses": sorted({record["candidate_hash"] for record in rejections})}
+        if backend == "codex_exec":
+            problem["code_build_rejections"] = sorted({r["proposal_hash"] for r in code_failures})
         problem_hash = canonical_hash(problem)
         days = sorted(groups)
         exposed = set()
@@ -274,7 +295,7 @@ class Coordinator:
             if previous.get("problem_hash") == problem_hash:
                 result_path = Path(previous["windows_output"]) / "result.json"
                 result = json.loads(result_path.read_bytes()) if result_path.exists() else {}
-                if result.get("status") not in {"candidate_ready", "replay_rejected", "no_change"}:
+                if result.get("status") not in {"candidate_ready", "replay_rejected", "no_change", "build_rejected"}:
                     return None  # No new budget for interrupted/unknown optimization.
             exposed.update(previous.get("training_days", []))
             exposed.update(previous.get("heldout_days", []))
@@ -353,9 +374,18 @@ class Coordinator:
             "training_days": training_days, "heldout_days": heldout_days,
             "selected_evolve_ids": [c.id for c in evolve], "collection_attempts": collection["attempt_count"]}
         atomic_json(directory / "job.json", job)
+        if backend == "codex_exec":
+            from .rsi_program import bundle_program
+            job["parent_program"] = bundle_program(self.store.home, active)
+            job["code_rejections"] = code_failures[-3:] + [{"candidate_hash": r["candidate_hash"], "status": r.get("status"),
+                "issues": (r.get("assessment") or {}).get("issues", [])} for r in rejections][-4:]
+            atomic_json(directory / "job.json", job)
         return job
 
     def optimize(self, job):
+        if job.get("optimizer_backend") == "codex_exec":
+            from .rsi_codex import optimize
+            return optimize(self, job)
         # Import the existing Windows DPAPI reader without exposing the key in
         # command arguments, environment variables, logs, or a WSL key file.
         import importlib.util

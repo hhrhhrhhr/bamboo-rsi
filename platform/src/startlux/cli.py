@@ -18,13 +18,17 @@ def main():
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("scenarios")
     rsi = commands.add_parser("rsi-genshin", help="durable prospective RSI coordinator")
-    rsi.add_argument("operation", choices=["init", "status", "cycle", "serve", "resume", "stop", "rollback"])
+    rsi.add_argument("operation", choices=["init", "status", "cycle", "serve", "resume", "stop", "rollback", "enable-codex"])
     rsi.add_argument("--home", type=Path, required=True)
     rsi.add_argument("--root", type=Path)
     rsi.add_argument("--host", type=Path)
     rsi.add_argument("--blocked-quota", action="store_true")
     rsi.add_argument("--wsl-python")
     rsi.add_argument("--wsl-distribution", default="Ubuntu-24.04")
+    rsi.add_argument("--codex-executable", default="codex")
+    rsi.add_argument("--max-codex-calls", type=int, default=8)
+    rsi.add_argument("--refresh-program-baseline", action="store_true",
+                     help="record an idle developer migration before any code promotion")
     for command in ("run", "optimize", "promote", "rollback"):
         sub = commands.add_parser(command)
         sub.add_argument("--scenario", required=True)
@@ -64,6 +68,11 @@ def main():
                 parser.error("RSI init needs --root and --host")
             result = initialize(args.home, args.root, args.host, blocked_quota=args.blocked_quota,
                                 wsl_python=args.wsl_python, distribution=args.wsl_distribution)
+        elif args.operation == "enable-codex":
+            from .scenarios.genshin.rsi_program import enable_codex
+            result = enable_codex(args.home, args.root or store.read("config.json")["root"],
+                                 executable=args.codex_executable, max_calls=args.max_codex_calls,
+                                 refresh=args.refresh_program_baseline)
         elif args.operation == "status":
             result = {"state": store.read("state.json"), "active": store.read("active.json")}
         elif args.operation == "stop":

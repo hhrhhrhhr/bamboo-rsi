@@ -24,10 +24,12 @@
       "platform/src/startlux/scenarios/genshin/evidence.py",
       "platform/src/startlux/scenarios/genshin/recording.py",
       "platform/src/startlux/scenarios/genshin/rsi.py",
+      "platform/src/startlux/scenarios/genshin/rsi_codex.py",
       "platform/src/startlux/scenarios/genshin/rsi_combat.py",
       "platform/src/startlux/scenarios/genshin/rsi_decision_search.py",
       "platform/src/startlux/scenarios/genshin/rsi_evidence.py",
       "platform/src/startlux/scenarios/genshin/rsi_labels.py",
+      "platform/src/startlux/scenarios/genshin/rsi_program.py",
       "platform/src/startlux/scenarios/genshin/rsi_rehearsal.py",
       "platform/src/startlux/scenarios/genshin/rsi_route.py",
       "platform/src/startlux/scenarios/genshin/rsi_service.py",
@@ -36,6 +38,7 @@
       "platform/tests/test_dev_launcher.py",
       "platform/tests/test_genshin_autonomy.py",
       "platform/tests/test_genshin_checkpoint.py",
+      "platform/tests/test_genshin_program.py",
       "platform/tests/test_genshin_recording.py",
       "platform/tests/test_genshin_rsi.py",
       "platform/tests/test_genshin_thinking.py",
@@ -43,8 +46,10 @@
       "scripts/check_public_tree.py",
       "scripts/create_genshin_admin_shortcut.ps1",
       "scripts/genshin_dev_controller.py",
+      "scripts/genshin_program_entry.py",
       "scripts/run_genshin_dev.py",
-      "scripts/run_genshin_rsi.py"
+      "scripts/run_genshin_rsi.py",
+      "scripts/validate_genshin_program.py"
     ]
   },
   "inherited_framework": {
