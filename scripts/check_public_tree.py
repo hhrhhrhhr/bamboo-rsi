@@ -4,6 +4,7 @@ Findings show file and line only, never matched secret values. This is a baselin
 pre-publication guard, not a guarantee that arbitrary sensitive data is absent.
 """
 from pathlib import Path
+import hashlib
 import json
 import re
 import subprocess
@@ -18,8 +19,19 @@ def main():
     paths = subprocess.check_output(["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"], cwd=ROOT)
     files = sorted(set(p.decode("utf-8") for p in paths.split(b"\0") if p))
     findings = []
+    pinned_root = "integrations/auto_commission/upstream/"
+    pinned = json.loads((ROOT / "integrations/auto_commission/source.json").read_text(encoding="utf-8"))["files"]
+    for name, expected in pinned.items():
+        full_name = pinned_root + name
+        path = ROOT / full_name
+        if full_name not in files or not path.is_file():
+            findings.append({"path": full_name, "rule": "missing_pinned_source"})
+        elif hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+            findings.append({"path": full_name, "rule": "changed_pinned_source"})
     for name in files:
-        if PRIVATE_PATH.search(name) or (Path(name).name.startswith('.env') and not name.endswith('.example')):
+        # This exact, hash-verified upstream file defines UI fields only.
+        upstream_ui_schema = name == pinned_root + "settings.json"
+        if (PRIVATE_PATH.search(name) and not upstream_ui_schema) or (Path(name).name.startswith('.env') and not name.endswith('.example')):
             findings.append({"path": name, "rule": "private_artifact"})
             continue
         path = ROOT / name

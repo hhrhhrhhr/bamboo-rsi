@@ -39,6 +39,8 @@ logs/
 *.pfx
 credentials.json
 settings.json
+# Upstream UI field definitions, not a user's saved settings.
+!integrations/auto_commission/upstream/settings.json
 settings.local.json
 secrets.json
 api-key.txt
