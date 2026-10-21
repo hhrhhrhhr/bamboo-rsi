@@ -62,4 +62,8 @@ platform/.venv/Scripts/python.exe scripts/build_genshin_desktop.py --bettergi .r
 
 ## 开源许可与来源
 
-原神运行平台、桌面端和派生集成沿用 **GPL-3.0-or-later**。BetterGI、AutoCommission、Harness² 及其他第三方文件保留各自许可证和作者信息，详见 [第三方说明](THIRD_PARTY_NOTICES.md)、`platform/LICENSE.Harness2` 和上游目录中的许可证。游戏名称、画面及识别模板涉及的游戏知识产权不因本仓库开源而转移。
+本项目原创的 RSI 增量、启动工具及相关文档采用 **[MIT](LICENSE)**，文件级范围见 [许可清单](LICENSE_SCOPE.json)。这是对本项目原创贡献的授权，不覆盖继承的 GPL 框架、BetterGI、AutoCommission 及其派生部分。
+
+从 Game Harness Lab 继承的框架保留 **GPL-3.0-or-later**；BetterGI、AutoCommission 及派生集成继续遵守各自 GPL 许可。当前 Python 包同时包含 MIT 原创增量和 GPL 继承代码，因此包元数据标为 `MIT AND GPL-3.0-or-later`。当前完整发行物不能作为全仓纯 MIT 软件分发；分发 GPL 覆盖的组合程序仍需满足相应 GPL 要求。
+
+第三方作者、许可证与来源均保留，详见 [第三方说明](THIRD_PARTY_NOTICES.md)、`platform/LICENSE`、`platform/LICENSE.MIT`、`platform/LICENSE.Harness2` 和上游目录中的许可证。游戏名称、画面及识别模板涉及的游戏知识产权不因本仓库开源而转移。

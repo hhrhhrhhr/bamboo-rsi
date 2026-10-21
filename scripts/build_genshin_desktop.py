@@ -111,6 +111,8 @@ def main():
     shutil.copyfile(ROOT / "THIRD_PARTY_NOTICES.md", target / "THIRD_PARTY_NOTICES.md")
     notices = target / "licenses"
     notices.mkdir()
+    shutil.copyfile(ROOT / "LICENSE", notices / "Bamboo-RSI-MIT.txt")
+    shutil.copyfile(ROOT / "LICENSE_SCOPE.json", notices / "Bamboo-RSI-LICENSE_SCOPE.json")
     # Python wheels' license files survive freezing regardless of PyInstaller hooks.
     for distribution in importlib.metadata.distributions():
         for file in distribution.files or []:

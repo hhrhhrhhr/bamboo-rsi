@@ -6,8 +6,11 @@ integration patch are supplied; apply the patch with git apply before building.
 Original authors: https://github.com/babalae/better-genshin-impact and
 https://github.com/LX666-666/AutoCommission (星野 and contributors).
 
-The added desktop UI, bundled Genshin agent and native integration are distributed
-under GPL-3.0-or-later. See sources/BetterGI-LICENSE for the complete GPL v3 text.
+Inherited desktop code, the bundled GPL-covered agent/framework and native
+integration retain their GPL terms. The project-original additions listed in
+LICENSE_SCOPE.json are also available under MIT; this does not relicense the
+inherited or upstream GPL code. See sources/BetterGI-LICENSE for the complete
+GPL v3 text and the corresponding source archive for LICENSE and LICENSE_SCOPE.json.
 No game client is included.
 
 Vosk API and vosk-model-small-cn-0.22: Apache-2.0

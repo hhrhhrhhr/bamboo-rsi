@@ -1,0 +1,151 @@
+{
+  "schema_version": 1,
+  "project": "Bamboo RSI",
+  "original_contributions": {
+    "license": "MIT",
+    "copyright": "2026 Bamboo RSI contributors",
+    "license_file": "LICENSE",
+    "files": [
+      ".github/workflows/source-checks.yml",
+      "LICENSE_SCOPE.json",
+      "README.md",
+      "Start-Genshin-RSI.cmd",
+      "Stop-Genshin-Dev.cmd",
+      "Stop-Genshin-RSI.cmd",
+      "THIRD_PARTY_NOTICES.md",
+      "Test-Genshin-Dev.cmd",
+      "config/settings.example.json",
+      "desktop/StartLux.Desktop.Tests/AgentFailureMessagesTests.cs",
+      "desktop/StartLux.Desktop/AgentFailureMessages.cs",
+      "integrations/auto_commission/agent-main.test.cjs",
+      "platform/src/startlux/core/model_budget.py",
+      "platform/src/startlux/scenarios/genshin/assessment.py",
+      "platform/src/startlux/scenarios/genshin/episode.py",
+      "platform/src/startlux/scenarios/genshin/evidence.py",
+      "platform/src/startlux/scenarios/genshin/recording.py",
+      "platform/src/startlux/scenarios/genshin/rsi.py",
+      "platform/src/startlux/scenarios/genshin/rsi_combat.py",
+      "platform/src/startlux/scenarios/genshin/rsi_decision_search.py",
+      "platform/src/startlux/scenarios/genshin/rsi_evidence.py",
+      "platform/src/startlux/scenarios/genshin/rsi_labels.py",
+      "platform/src/startlux/scenarios/genshin/rsi_rehearsal.py",
+      "platform/src/startlux/scenarios/genshin/rsi_route.py",
+      "platform/src/startlux/scenarios/genshin/rsi_service.py",
+      "platform/src/startlux/scenarios/genshin/rsi_worker.py",
+      "platform/src/startlux/scenarios/genshin/supervisor.py",
+      "platform/tests/test_dev_launcher.py",
+      "platform/tests/test_genshin_autonomy.py",
+      "platform/tests/test_genshin_checkpoint.py",
+      "platform/tests/test_genshin_recording.py",
+      "platform/tests/test_genshin_rsi.py",
+      "platform/tests/test_genshin_thinking.py",
+      "platform/tests/test_rsi_launcher.py",
+      "scripts/check_public_tree.py",
+      "scripts/create_genshin_admin_shortcut.ps1",
+      "scripts/genshin_dev_controller.py",
+      "scripts/run_genshin_dev.py",
+      "scripts/run_genshin_rsi.py"
+    ]
+  },
+  "inherited_framework": {
+    "license": "GPL-3.0-or-later",
+    "license_file": "platform/LICENSE",
+    "source_repository": "https://github.com/dctongsheng/game-harness-lab",
+    "source_commit": "1a7b0cac0729d1140946d48baa4cc273db6ceacd",
+    "files": [
+      "contracts/README.md",
+      "contracts/game-spec.schema.json",
+      "contracts/harness.schema.json",
+      "desktop/StartLux.Desktop.Tests/StartLux.Desktop.Tests.csproj",
+      "desktop/StartLux.Desktop.Tests/VoiceIntentTests.cs",
+      "desktop/StartLux.Desktop/App.xaml",
+      "desktop/StartLux.Desktop/App.xaml.cs",
+      "desktop/StartLux.Desktop/LocalVoice.cs",
+      "desktop/StartLux.Desktop/MainViewModel.cs",
+      "desktop/StartLux.Desktop/MainWindow.xaml",
+      "desktop/StartLux.Desktop/MainWindow.xaml.cs",
+      "desktop/StartLux.Desktop/StartLux.Desktop.csproj",
+      "desktop/StartLux.Desktop/VoiceIntent.cs",
+      "desktop/StartLux.Desktop/app.manifest",
+      "desktop/installer.iss",
+      "platform/.dockerignore",
+      "platform/Dockerfile",
+      "platform/README.md",
+      "platform/examples/genshin/config.json",
+      "platform/examples/genshin/pack/actions.json",
+      "platform/examples/genshin/pack/instructions.txt",
+      "platform/examples/genshin/pack/manifest.json",
+      "platform/examples/genshin/synthetic-suite.json",
+      "platform/examples/workspace/config.json",
+      "platform/examples/workspace/dataset.json",
+      "platform/pyproject.toml",
+      "platform/requirements-optimizer.lock",
+      "platform/src/startlux/__init__.py",
+      "platform/src/startlux/cli.py",
+      "platform/src/startlux/core/__init__.py",
+      "platform/src/startlux/core/contracts.py",
+      "platform/src/startlux/core/decision.py",
+      "platform/src/startlux/core/engine.py",
+      "platform/src/startlux/core/releases.py",
+      "platform/src/startlux/core/scenario.py",
+      "platform/src/startlux/core/settings.py",
+      "platform/src/startlux/core/storage.py",
+      "platform/src/startlux/optimization/__init__.py",
+      "platform/src/startlux/optimization/harness2_backend.py",
+      "platform/src/startlux/optimization/improver.py",
+      "platform/src/startlux/registry.py",
+      "platform/src/startlux/scenarios/genshin/__init__.py",
+      "platform/src/startlux/scenarios/genshin/contracts.py",
+      "platform/src/startlux/scenarios/genshin/daily.py",
+      "platform/src/startlux/scenarios/genshin/decision.py",
+      "platform/src/startlux/scenarios/genshin/desktop.py",
+      "platform/src/startlux/scenarios/genshin/import_trace.py",
+      "platform/src/startlux/scenarios/genshin/runner.py",
+      "platform/src/startlux/scenarios/genshin/scenario.py",
+      "platform/src/startlux/scenarios/genshin/snapshot.py",
+      "platform/src/startlux/scenarios/genshin/taskpack.py",
+      "platform/src/startlux/scenarios/genshin/windows_pipe.py",
+      "platform/src/startlux/scenarios/workspace/__init__.py",
+      "platform/src/startlux/scenarios/workspace/scenario.py",
+      "platform/src/startlux/testing.py",
+      "platform/tests/test_genshin.py",
+      "platform/tests/test_platform.py",
+      "scripts/build_genshin_desktop.py",
+      "scripts/genshin_desktop_entry.py",
+      "scripts/setup_genshin_bridge.py",
+      "scripts/test_genshin_installer.ps1"
+    ]
+  },
+  "upstream_components": [
+    {
+      "paths": [
+        "integrations/bettergi/**"
+      ],
+      "license": "GPL-3.0",
+      "notice": "integrations/bettergi/source.json"
+    },
+    {
+      "paths": [
+        "integrations/auto_commission/upstream/**",
+        "integrations/auto_commission/agent-main.js"
+      ],
+      "license": "GPL-3.0",
+      "license_file": "integrations/auto_commission/upstream/LICENSE"
+    },
+    {
+      "paths": [
+        "platform/LICENSE.Harness2"
+      ],
+      "license": "Apache-2.0",
+      "notice": "THIRD_PARTY_NOTICES.md"
+    },
+    {
+      "paths": [
+        "desktop/APACHE-2.0.txt"
+      ],
+      "license": "Apache-2.0",
+      "notice": "desktop/THIRD_PARTY_NOTICES.txt"
+    }
+  ],
+  "interpretation": "MIT applies only to the listed original contributions. Existing notices and third-party rights remain intact. This is not a repository-wide relicensing of inherited GPL code. Distributing a combined GPL-covered work must also comply with the applicable GPL terms."
+}
