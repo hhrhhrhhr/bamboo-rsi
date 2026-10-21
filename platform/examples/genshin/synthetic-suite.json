@@ -1,0 +1,146 @@
+{
+  "schema_version": 1,
+  "evidence_origin": "synthetic",
+  "cases": [
+    {
+      "id": "snapshot-case-0",
+      "split": "evolve",
+      "observation": {
+        "session_id": "fixture-session",
+        "scope": {
+          "account_id": "fixture-account",
+          "server_id": "fixture-server",
+          "game_day": "2026-10-18"
+        },
+        "frame_id": 0,
+        "control_generation": 0,
+        "facts": {
+          "region": "mondstadt",
+          "scene": "world",
+          "phase": "inspect"
+        },
+        "images": []
+      },
+      "acceptable_actions": [
+        {
+          "id": "inspect",
+          "skill": "observe.daily",
+          "skill_version": "1",
+          "arguments": {}
+        }
+      ],
+      "expect_abstention": false
+    },
+    {
+      "id": "snapshot-case-1",
+      "split": "evolve",
+      "observation": {
+        "session_id": "fixture-session",
+        "scope": {
+          "account_id": "fixture-account",
+          "server_id": "fixture-server",
+          "game_day": "2026-10-18"
+        },
+        "frame_id": 1,
+        "control_generation": 0,
+        "facts": {
+          "region": "mondstadt",
+          "scene": "world",
+          "phase": "combat"
+        },
+        "images": []
+      },
+      "acceptable_actions": [
+        {
+          "id": "fight",
+          "skill": "combat.run",
+          "skill_version": "1",
+          "arguments": {}
+        }
+      ],
+      "expect_abstention": false
+    },
+    {
+      "id": "snapshot-case-2",
+      "split": "evolve",
+      "observation": {
+        "session_id": "fixture-session",
+        "scope": {
+          "account_id": "fixture-account",
+          "server_id": "fixture-server",
+          "game_day": "2026-10-18"
+        },
+        "frame_id": 2,
+        "control_generation": 0,
+        "facts": {
+          "region": "mondstadt",
+          "scene": "world",
+          "phase": "reward",
+          "commissions_verified": true
+        },
+        "images": []
+      },
+      "acceptable_actions": [
+        {
+          "id": "claim",
+          "skill": "daily.claim",
+          "skill_version": "1",
+          "arguments": {}
+        }
+      ],
+      "expect_abstention": false
+    },
+    {
+      "id": "snapshot-case-3",
+      "split": "heldout",
+      "observation": {
+        "session_id": "fixture-session",
+        "scope": {
+          "account_id": "fixture-account",
+          "server_id": "fixture-server",
+          "game_day": "2026-10-18"
+        },
+        "frame_id": 3,
+        "control_generation": 0,
+        "facts": {
+          "region": "mondstadt",
+          "scene": "world",
+          "phase": "inspect"
+        },
+        "images": []
+      },
+      "acceptable_actions": [
+        {
+          "id": "inspect",
+          "skill": "observe.daily",
+          "skill_version": "1",
+          "arguments": {}
+        }
+      ],
+      "expect_abstention": false
+    },
+    {
+      "id": "snapshot-case-4",
+      "split": "heldout",
+      "observation": {
+        "session_id": "fixture-session",
+        "scope": {
+          "account_id": "fixture-account",
+          "server_id": "fixture-server",
+          "game_day": "2026-10-18"
+        },
+        "frame_id": 4,
+        "control_generation": 0,
+        "facts": {
+          "region": "mondstadt",
+          "scene": "world",
+          "phase": "uncertain",
+          "fixture_abstain": true
+        },
+        "images": []
+      },
+      "acceptable_actions": [],
+      "expect_abstention": true
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+name: StartLux optimizer container
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  container:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the standalone optimizer image
+        run: docker build --tag startlux-optimizer:ci platform
+      - name: Verify installed plugins and actual Harness2 recursion in the image
+        run: |
+          docker run --rm startlux-optimizer:ci scenarios
+          docker run --rm startlux-optimizer:ci optimize --scenario workspace.ledger --config /app/examples/workspace/config.json --output /tmp/workspace-run --fixture

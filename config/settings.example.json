@@ -1,0 +1,10 @@
+{
+  "game_path": "",
+  "uid": "",
+  "server_label": "中国大陆",
+  "server_id": "cn",
+  "server_utc_offset_minutes": 480,
+  "model_id": "startlux-decision-27b-autothink",
+  "decision_model_confirmed": false,
+  "decision_url": "https://api.bamboonode.cn/v1/decisions"
+}

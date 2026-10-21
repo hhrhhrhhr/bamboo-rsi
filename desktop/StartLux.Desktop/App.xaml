@@ -1,0 +1,6 @@
+<Application x:Class="StartLux.Desktop.App" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" StartupUri="MainWindow.xaml">
+  <Application.Resources>
+    <Style TargetType="TextBox"><Setter Property="Padding" Value="10,7"/><Setter Property="Margin" Value="0,4,0,12"/></Style>
+    <Style TargetType="Button"><Setter Property="Padding" Value="16,10"/><Setter Property="Margin" Value="0,0,10,0"/></Style>
+  </Application.Resources>
+</Application>

@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Proposed frozen GameSpec v0.1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "artifact_status", "game_spec_id", "game", "upstream", "clock", "observation", "actions", "scoring", "limits", "prerequisites"],
+  "properties": {
+    "schema_version": {"const": "0.1"},
+    "artifact_status": {"const": "design_example"},
+    "game_spec_id": {"type": "string", "minLength": 1},
+    "game": {"enum": ["snake", "tetris", "super_mario_bros"]},
+    "upstream": {
+      "type": "object", "additionalProperties": false,
+      "required": ["repository", "commit", "source_license", "integration_verified"],
+      "properties": {
+        "repository": {"type": "string", "format": "uri"},
+        "commit": {"type": "string", "pattern": "^[a-f0-9]{40}$"},
+        "source_license": {"type": "string"},
+        "integration_verified": {"const": false}
+      }
+    },
+    "clock": {
+      "type": "object", "additionalProperties": false,
+      "required": ["mode", "wait_advances_game", "wall_time_recorded"],
+      "properties": {
+        "mode": {"const": "paused_step"},
+        "wait_advances_game": {"const": false},
+        "wall_time_recorded": {"const": true}
+      }
+    },
+    "observation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["mode", "allowed_fields", "forbidden_fields", "copy_on_capture"],
+      "properties": {
+        "mode": {"const": "structured_research"},
+        "allowed_fields": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string"}},
+        "forbidden_fields": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+        "copy_on_capture": {"const": true}
+      }
+    },
+    "actions": {
+      "type": "object", "additionalProperties": false,
+      "required": ["catalog_id", "abstraction", "selection_owner", "catalog_description", "duration", "strategy_pruning", "requested_and_applied_logged"],
+      "properties": {
+        "catalog_id": {"type": "string", "minLength": 1},
+        "abstraction": {"enum": ["primitive_direction", "primitive_key", "fixed_duration_buttons"]},
+        "selection_owner": {"const": "decision_model"},
+        "catalog_description": {"type": "string", "minLength": 1},
+        "duration": {"type": "string", "minLength": 1},
+        "strategy_pruning": {"const": false},
+        "requested_and_applied_logged": {"const": true}
+      }
+    },
+    "scoring": {
+      "type": "object", "additionalProperties": false,
+      "required": ["score_version", "raw_score", "primary_objective", "auxiliary_metrics", "reward_is_raw_score", "optimizer_can_edit"],
+      "properties": {
+        "score_version": {"type": "string", "minLength": 1},
+        "raw_score": {"type": "string", "minLength": 1},
+        "primary_objective": {"type": "string", "minLength": 1},
+        "auxiliary_metrics": {"type": "array", "items": {"type": "string"}},
+        "reward_is_raw_score": {"const": false},
+        "optimizer_can_edit": {"const": false}
+      }
+    },
+    "limits": {
+      "type": "object", "additionalProperties": false,
+      "required": ["max_decisions", "limit_status"],
+      "properties": {
+        "max_decisions": {"type": "integer", "minimum": 1},
+        "limit_status": {"const": "proposal_calibrate_before_benchmark"}
+      }
+    },
+    "prerequisites": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}
+  }
+}

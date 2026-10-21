@@ -1,0 +1,287 @@
+name: 同步代码并创建PR_test
+
+on:
+  workflow_dispatch: # 仅手动触发
+    inputs:
+      version:
+        description: '版本号（自动递增，可指定，必须有两个点分隔,例：0.98.1）'
+        required: false
+        type: string
+      pr_target:
+        description: 'PR 目标仓库'
+        required: true
+        type: choice
+        default: 'upstream'
+        options:
+          - fork
+          - upstream
+
+jobs:
+  update-version:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出当前仓库
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ssh-key: ${{ secrets.SSH_PRIVATE_KEY_CURRENT }}
+
+      - name: 配置Git
+        run: |
+          git config --global user.name "DarkFlameMaster"
+          git config --global user.email "actions@github.com"
+          # 配置SSH
+          git config --global url."git@github.com:".insteadOf "https://github.com/"
+
+      - name: 设置SSH密钥
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY_CURRENT }}
+
+      - name: 读取当前版本号
+        id: get-current-version
+        run: |
+          CURRENT_VERSION=$(jq -r .version manifest.json)
+          echo "current_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+
+      - name: 计算新版本号
+        id: calculate-new-version
+        run: |
+          # 如果用户提供了版本号，则使用该版本号
+          if [ -n "${{ inputs.version }}" ]; then
+            NEW_VERSION="${{ inputs.version }}"
+          else
+            # 否则自动递增版本号（遵循语义化版本规范）
+            CURRENT_VERSION=$(jq -r .version manifest.json)
+            # 拆分版本号：major.minor.patch
+            IFS="." read -r major minor patch <<< "$CURRENT_VERSION"
+            # 递增patch版本号
+            patch=$((patch + 1))
+            NEW_VERSION="$major.$minor.$patch"
+          fi
+          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+
+      - name: 更新manifest.json中的版本号
+        run: |
+          jq --arg version "${{ steps.calculate-new-version.outputs.new_version }}" '.version = $version' manifest.json > manifest.json.tmp && mv manifest.json.tmp manifest.json
+
+      - name: 自动补齐README更新日志
+        run: |
+          python3 <<'PY'
+          from datetime import datetime
+          from pathlib import Path
+          import os
+          import re
+
+          readme_path = Path("README.md")
+          new_version = os.environ["NEW_VERSION"]
+          now = datetime.now().astimezone()
+          today = now.strftime("%Y-%m-%d")
+          current_time = now.strftime("%Y-%m-%d %H:%M:%S %Z")
+
+          original_bytes = readme_path.read_bytes() if readme_path.exists() else b""
+          newline = "\r\n" if b"\r\n" in original_bytes else "\n"
+          readme = original_bytes.decode("utf-8") if original_bytes else ""
+          readme = readme.replace("\r\n", "\n")
+          changelog_heading = "## 更新日志"
+          if changelog_heading not in readme:
+              readme = readme.rstrip() + f"\n\n{changelog_heading}\n"
+
+          before, heading, after = readme.partition(changelog_heading)
+          version_pattern = re.compile(r"^###\s+(?:当前版本|上一版本|旧版本)：" + re.escape(new_version) + r"(?:\s|$)", re.MULTILINE)
+          if version_pattern.search(after):
+              with readme_path.open("w", encoding="utf-8", newline=newline) as file:
+                  file.write(readme)
+              raise SystemExit(0)
+
+          current_pattern = re.compile(r"^(###\s+)当前版本：", re.MULTILINE)
+          after = current_pattern.sub(r"\1上一版本：", after, count=1)
+          new_entry = (
+              f"\n### 当前版本：{new_version} ({today})\n"
+              f"- 修复已知问题 ({current_time})\n"
+          )
+          with readme_path.open("w", encoding="utf-8", newline=newline) as file:
+              file.write(before + heading + new_entry + after)
+          PY
+        env:
+          NEW_VERSION: ${{ steps.calculate-new-version.outputs.new_version }}
+
+      - name: 提交版本号更新
+        run: |
+          git add manifest.json README.md
+          if git diff --cached --quiet; then
+            echo "版本号和README更新日志没有变化，跳过提交。"
+          else
+            git commit -m "Bump version to ${{ steps.calculate-new-version.outputs.new_version }}"
+            git push origin HEAD:main
+          fi
+
+      - name: 创建并推送tag
+        run: |
+          TAG_NAME="v${{ steps.calculate-new-version.outputs.new_version }}"
+          if git rev-parse "$TAG_NAME" >/dev/null 2>&1 || git ls-remote --exit-code --tags origin "$TAG_NAME" >/dev/null 2>&1; then
+            echo "Tag $TAG_NAME 已存在，跳过创建。"
+          else
+            git tag "$TAG_NAME"
+            git push origin "$TAG_NAME"
+          fi
+
+  sync-and-pr:
+    runs-on: ubuntu-latest
+    needs: update-version
+    steps:
+      - name: 检出当前仓库
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ssh-key: ${{ secrets.SSH_PRIVATE_KEY }}
+          ref: main
+
+      - name: 拉取最新更改
+        run: |
+          git pull origin main
+
+      - name: 配置Git
+        run: |
+          git config --global user.name "DarkFlameMaster"
+          git config --global user.email "actions@github.com"
+          # 配置SSH
+          git config --global url."git@github.com:".insteadOf "https://github.com/"
+
+      - name: 设置SSH密钥
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: 克隆fork仓库
+        uses: actions/checkout@v4
+        with:
+          repository: 1004452714/bettergi-scripts-list
+          ref: main
+          path: fork
+          ssh-key: ${{ secrets.SSH_PRIVATE_KEY }}
+          fetch-depth: 0
+          sparse-checkout: |
+            repo/js/AutoCommission
+
+      - name: 添加上游仓库
+        run: |
+          cd fork
+          git remote add upstream git@github.com:babalae/bettergi-scripts-list.git
+
+      - name: 同步上游仓库（变基）
+        run: |
+          cd fork
+          # 获取上游仓库的最新代码
+          git fetch upstream main
+          # 变基同步到上游仓库
+          git rebase upstream/main
+          # 如果变基成功，推送更新到fork仓库
+          git push origin main --force-with-lease
+
+      - name: 创建唯一分支名
+        id: create-branch-name
+        run: |
+          # 生成包含时间戳的唯一分支名
+          BRANCH_NAME="sync-auto-commission-$(date +%Y%m%d%H%M%S)"
+          echo "branch_name=$BRANCH_NAME" >> $GITHUB_OUTPUT
+
+      - name: 在fork仓库中创建新分支
+        run: |
+          cd fork
+          git checkout -b ${{ steps.create-branch-name.outputs.branch_name }}
+
+      - name: 同步代码到fork仓库
+        run: |
+          # 清空目标目录
+          rm -rf fork/repo/js/AutoCommission/*
+          # 复制代码，排除指定目录和文件
+          rsync -av --exclude='.idea' --exclude='.github' --exclude='LICENSE' --exclude='.gitattributes' --exclude='fork' ./ fork/repo/js/AutoCommission/
+
+      - name: 获取提交记录
+        id: get-commit-messages
+        run: |
+          # 获取所有tag并按版本号排序（最新的在最后）
+          ALL_TAGS=$(git tag -l "v*" | sort -V)
+          # 转换为数组
+          mapfile -t TAGS_ARRAY <<< "$ALL_TAGS"
+          TAG_COUNT=${#TAGS_ARRAY[@]}
+          
+          if [ $TAG_COUNT -ge 2 ]; then
+            # 获取最新的两个tag
+            PREVIOUS_TAG=${TAGS_ARRAY[$TAG_COUNT-2]}
+            CURRENT_TAG=${TAGS_ARRAY[$TAG_COUNT-1]}
+            # 获取两个tag之间的提交记录
+            COMMITS=$(git log $PREVIOUS_TAG..$CURRENT_TAG --pretty=format:"- %h %s")
+            echo "has_commits=true" >> $GITHUB_OUTPUT
+          else
+            COMMITS=""
+            echo "has_commits=false" >> $GITHUB_OUTPUT
+          fi
+          echo "commits<<EOF" >> $GITHUB_OUTPUT
+          echo "$COMMITS" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: 检查是否有更改需要提交
+        id: check-changes
+        run: |
+          cd fork
+          git add repo/js/AutoCommission/*
+          if git diff --cached --quiet; then
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 提交并推送代码到fork仓库
+        if: steps.check-changes.outputs.has_changes == 'true'
+        run: |
+          cd fork
+          git commit -m "同步AutoCommission更新"
+          git push origin ${{ steps.create-branch-name.outputs.branch_name }}
+
+      - name: 读取当前版本号
+        id: get-version
+        run: |
+          CURRENT_VERSION=$(jq -r .version manifest.json)
+          echo "current_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+
+      - name: 使用GitHub API创建PR
+        if: steps.check-changes.outputs.has_changes == 'true'
+        run: |
+          PR_BODY="同步[AutoCommission](https://github.com/1004452714/AutoCommission/commits/main/)仓库的更新"
+          if [ "${{ steps.get-commit-messages.outputs.has_commits }}" = "true" ]; then
+            # 当has_commits为true时，追加提交信息内容
+            PR_BODY="${PR_BODY}
+          
+            上次同步以来的变更：
+            ${{ steps.get-commit-messages.outputs.commits }}"
+          fi
+
+          # 转义特殊字符，避免JSON报错（必须保留，否则换行符会破坏JSON格式）
+          PR_BODY_ESCAPED=$(echo "$PR_BODY" | jq -R -s '.')
+          
+          # 根据选择的目标仓库决定PR的目标
+          if [ "${{ github.event.inputs.pr_target }}" = "upstream" ]; then
+            # 向上游仓库创建PR
+            TARGET_REPO="babalae/bettergi-scripts-list"
+            HEAD_BRANCH="1004452714:${{ steps.create-branch-name.outputs.branch_name }}"
+          else
+            # 向fork仓库创建PR（测试用）
+            TARGET_REPO="1004452714/bettergi-scripts-list"
+            HEAD_BRANCH="${{ steps.create-branch-name.outputs.branch_name }}"
+          fi
+          
+          # 调用GitHub API创建PR
+          curl -X POST \
+          -H "Authorization: token ${{ secrets.SYNC_TOKEN }}" \
+          -H "Accept: application/vnd.github.v3+json" \
+          https://api.github.com/repos/$TARGET_REPO/pulls \
+          -d @- <<- EOF
+              {
+                "title": "AutoCommission ${{ steps.get-version.outputs.current_version }}",
+                "body": $PR_BODY_ESCAPED,
+                "head": "$HEAD_BRANCH",
+                "base": "main"
+              }
+          EOF

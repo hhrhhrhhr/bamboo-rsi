@@ -1,0 +1,2308 @@
+diff --git a/BetterGenshinImpact.AgentBridge/AgentCommandHost.cs b/BetterGenshinImpact.AgentBridge/AgentCommandHost.cs
+new file mode 100644
+--- /dev/null
++++ b/BetterGenshinImpact.AgentBridge/AgentCommandHost.cs
+@@ -0,0 +1,340 @@
++using System.Diagnostics;
++using Newtonsoft.Json.Linq;
++
++namespace BetterGenshinImpact.AgentBridge;
++
++public sealed record GameObservation(JObject Scope, JObject Facts, string[] Images);
++public sealed record SkillOutcome(string Status, string Reason, JObject Evidence);
++
++public interface IAgentGameBackend
++{
++    Task<GameObservation> CaptureAsync(CancellationToken cancellationToken);
++    Task<SkillOutcome> ExecuteAsync(JObject option, CancellationToken cancellationToken);
++    void ReleaseInputs();
++}
++
++/// <summary>
++/// Local authority for one input lease. No model request runs in this process.
++/// Cached observations and full options are authoritative; client hashes are
++/// audit references, never substitutes for host-side semantic validation.
++/// </summary>
++public sealed class AgentCommandHost : IAsyncDisposable
++{
++    private sealed record Frame(JObject Observation, JArray Options, long CapturedAt);
++    private sealed class CommandState(JObject command)
++    {
++        internal JObject Command { get; } = (JObject)command.DeepClone();
++        internal JObject Result { get; set; } = ResultFor(command.Value<string>("command_id")!, "running");
++        internal long StartBy { get; set; }
++        internal long Deadline { get; set; }
++    }
++
++    private readonly object _gate = new();
++    private readonly SemaphoreSlim _captureGate = new(1, 1);
++    private readonly IAgentGameBackend _backend;
++    private readonly JArray _options;
++    private readonly JObject _metadata;
++    private readonly Dictionary<long, Frame> _frames = new();
++    private readonly Dictionary<string, CommandState> _commands = new(StringComparer.Ordinal);
++    private readonly CancellationTokenSource _lifetime = new();
++    private readonly Task _watchdog;
++    private readonly TimeSpan _leaseTimeout;
++    private readonly string _sessionId = Guid.NewGuid().ToString("N");
++    private long _frameId;
++    private long _generation;
++    private long _lastContact = Stopwatch.GetTimestamp();
++    private bool _halted = true;
++    private bool _disposed;
++    private bool _releaseFailed;
++    private JObject? _scope;
++    private CommandState? _active;
++    private CancellationTokenSource? _activeCancellation;
++
++    public AgentCommandHost(IAgentGameBackend backend, JArray options, TimeSpan? leaseTimeout = null, JObject? metadata = null)
++    {
++        _backend = backend;
++        _options = (JArray)options.DeepClone();
++        _metadata = (JObject)(metadata?.DeepClone() ?? new JObject());
++        _metadata["capabilities"] = new JArray("command_checkpoint_v1");
++        var ids = new HashSet<string>(StringComparer.Ordinal);
++        foreach (var option in _options.Cast<JObject>())
++        {
++            if (string.IsNullOrWhiteSpace(option.Value<string>("id")) || !ids.Add(option.Value<string>("id")!)
++                || option["preconditions"] is not JObject { Count: > 0 }
++                || option.Value<int>("ttl_ms") is < 100 or > 30000
++                || option.Value<int>("timeout_ms") is < 100 or > 300000)
++                throw new ArgumentException("Invalid or duplicate agent option.", nameof(options));
++        }
++        _leaseTimeout = leaseTimeout ?? TimeSpan.FromSeconds(3);
++        if (_leaseTimeout <= TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(leaseTimeout));
++        _watchdog = WatchdogAsync();
++    }
++
++    public JObject Describe() => (JObject)_metadata.DeepClone();
++
++    public void Arm()
++    {
++        lock (_gate)
++        {
++            ObjectDisposedException.ThrowIf(_disposed, this);
++            if (_releaseFailed) throw new InvalidOperationException("Input release failed; restart the execution host.");
++            if (_active is not null) throw new InvalidOperationException("Previous skill is still stopping.");
++            _halted = false;
++            _generation++;
++            _frames.Clear();
++            _lastContact = Stopwatch.GetTimestamp();
++        }
++    }
++
++    public async Task<JObject> ObserveAsync(CancellationToken cancellationToken)
++    {
++        await _captureGate.WaitAsync(cancellationToken).ConfigureAwait(false);
++        try
++        {
++            var captured = await _backend.CaptureAsync(cancellationToken).ConfigureAwait(false);
++            bool changed;
++            lock (_gate) changed = _scope is not null && !JToken.DeepEquals(_scope, captured.Scope);
++            if (changed) Stop();
++            lock (_gate)
++            {
++                ObjectDisposedException.ThrowIf(_disposed, this);
++                _scope = (JObject)captured.Scope.DeepClone();
++                var observation = new JObject
++                {
++                    ["session_id"] = _sessionId, ["scope"] = _scope.DeepClone(),
++                    ["frame_id"] = ++_frameId, ["control_generation"] = _generation,
++                    ["facts"] = captured.Facts.DeepClone(), ["images"] = new JArray(captured.Images)
++                };
++                var options = _halted ? new JArray() : new JArray(_options.Cast<JObject>()
++                    .Where(option => Available(option, captured.Facts)).Select(option => option.DeepClone()));
++                _frames.Add(_frameId, new Frame((JObject)observation.DeepClone(), options, Stopwatch.GetTimestamp()));
++                while (_frames.Count > 128) _frames.Remove(_frames.Keys.Min());
++                if (_active is null) _lastContact = Stopwatch.GetTimestamp();
++                return observation;
++            }
++        }
++        finally { _captureGate.Release(); }
++    }
++
++    public JArray Candidates(long frameId)
++    {
++        lock (_gate)
++        {
++            if (_active is null) _lastContact = Stopwatch.GetTimestamp();
++            if (!_frames.TryGetValue(frameId, out var frame)) throw new InvalidOperationException("Unknown frame.");
++            return (JArray)frame.Options.DeepClone();
++        }
++    }
++
++    public async Task<JObject> StartAsync(JObject command, CancellationToken cancellationToken)
++    {
++        var identity = command.Value<string>("command_id");
++        if (string.IsNullOrWhiteSpace(identity) || identity.Length > 128)
++            throw new ArgumentException("Invalid command ID.");
++        lock (_gate)
++        {
++            if (_commands.TryGetValue(identity, out var existing))
++            {
++                if (!JToken.DeepEquals(existing.Command, command)) throw new ArgumentException("Command ID reused with a different payload.");
++                _lastContact = Stopwatch.GetTimestamp();
++                return (JObject)existing.Result.DeepClone();
++            }
++        }
++        // Capture outside the command lock so a blocked screenshot cannot block stop.
++        var current = await ObserveAsync(cancellationToken).ConfigureAwait(false);
++        lock (_gate)
++        {
++            if (_commands.TryGetValue(identity, out var existing))
++            {
++                if (!JToken.DeepEquals(existing.Command, command)) throw new ArgumentException("Command ID reused with a different payload.");
++                return (JObject)existing.Result.DeepClone();
++            }
++            ObjectDisposedException.ThrowIf(_disposed, this);
++            if (_halted || _active is not null) return ResultFor(identity, "cancelled", "host_stopped_or_busy");
++            if (_commands.Count >= 4096) throw new InvalidOperationException("Command ledger is full; restart the session.");
++            if (command["source_frame_id"]?.Type != JTokenType.Integer
++                || !_frames.TryGetValue(command.Value<long>("source_frame_id"), out var source)
++                || command["control_generation"]?.Type != JTokenType.Integer
++                || command.Value<long>("control_generation") != _generation
++                || command.Value<string>("session_id") != _sessionId
++                || !JToken.DeepEquals(command["scope"], current["scope"])
++                || !JToken.DeepEquals(source.Observation["scope"], current["scope"])
++                || source.Observation.Value<long>("control_generation") != _generation
++                || command.Value<string>("origin") != "decision"
++                || command.Value<string>("action_granularity") != "skill"
++                || command["option"] is not JObject option)
++                return ResultFor(identity, "cancelled", "stale_or_invalid_binding");
++            var offered = source.Options.Cast<JObject>().SingleOrDefault(item => item.Value<string>("id") == option.Value<string>("id"));
++            if (offered is null || !JToken.DeepEquals(offered, option)
++                || !Available(option, (JObject)current["facts"]!))
++                return ResultFor(identity, "cancelled", "action_semantics_or_preconditions_changed");
++            var elapsed = Stopwatch.GetElapsedTime(source.CapturedAt).TotalMilliseconds;
++            if (command["remaining_ttl_ms"]?.Type != JTokenType.Integer
++                || command.Value<int>("remaining_ttl_ms") <= 0 || elapsed >= option.Value<int>("ttl_ms"))
++                return ResultFor(identity, "cancelled", "expired");
++            var now = Stopwatch.GetTimestamp();
++            var state = new CommandState(command)
++            {
++                Deadline = now + (long)(option.Value<int>("timeout_ms") * (double)Stopwatch.Frequency / 1000),
++                StartBy = Math.Min(source.CapturedAt + (long)(option.Value<int>("ttl_ms") * (double)Stopwatch.Frequency / 1000),
++                    now + (long)(command.Value<int>("remaining_ttl_ms") * (double)Stopwatch.Frequency / 1000))
++            };
++            var cancellation = new CancellationTokenSource(option.Value<int>("timeout_ms"));
++            _active = state;
++            _activeCancellation = cancellation;
++            _commands.Add(identity, state);
++            _lastContact = Stopwatch.GetTimestamp();
++            _ = Task.Run(() => ExecuteAsync(state, (JObject)option.DeepClone(), cancellation));
++            return (JObject)state.Result.DeepClone();
++        }
++    }
++
++    public JObject Reconcile(string commandId)
++    {
++        lock (_gate)
++        {
++            if (_active?.Command.Value<string>("command_id") == commandId)
++                _lastContact = Stopwatch.GetTimestamp();
++            return _commands.TryGetValue(commandId, out var state)
++                ? (JObject)state.Result.DeepClone() : ResultFor(commandId, "unknown", "command_not_found");
++        }
++    }
++
++    public JObject Cancel(string commandId)
++    {
++        bool active;
++        lock (_gate) active = _active?.Command.Value<string>("command_id") == commandId;
++        if (active) Stop();
++        return Reconcile(commandId);
++    }
++
++    // A deadline checkpoint cancels only the expiring daily skill. It never
++    // arms a halted host or changes the generation set by a manual stop.
++    public JObject Checkpoint(string commandId)
++    {
++        CancellationTokenSource? cancellation;
++        lock (_gate)
++        {
++            if (_halted || _releaseFailed || !_commands.TryGetValue(commandId, out var state)
++                || state.Command.Value<long>("control_generation") != _generation
++                || state.Command["option"]?.Value<string>("skill") != "daily.execute")
++                return ResultFor(commandId, "unknown", "checkpoint_unavailable");
++            if (Stopwatch.GetTimestamp() < state.Deadline)
++                return ResultFor(commandId, "running", "checkpoint_before_deadline");
++            cancellation = ReferenceEquals(_active, state) ? _activeCancellation : null;
++        }
++        try { cancellation?.Cancel(); }
++        catch (ObjectDisposedException) { }
++        finally { if (cancellation is not null) ReleaseInputs(); }
++        lock (_gate)
++        {
++            if (_halted || _releaseFailed)
++                return ResultFor(commandId, "unknown", "checkpoint_invalidated");
++        }
++        return Reconcile(commandId);
++    }
++
++    public void Stop()
++    {
++        CancellationTokenSource? cancellation;
++        lock (_gate)
++        {
++            _halted = true;
++            _generation++;
++            _frames.Clear();
++            cancellation = _activeCancellation;
++        }
++        try { cancellation?.Cancel(); }
++        catch (ObjectDisposedException) { }
++        finally { ReleaseInputs(); }
++    }
++
++    private async Task ExecuteAsync(CommandState state, JObject option, CancellationTokenSource cancellation)
++    {
++        using var releaseOnCancel = cancellation.Token.Register(ReleaseInputs);
++        JObject result;
++        try
++        {
++            cancellation.Token.ThrowIfCancellationRequested();
++            if (Stopwatch.GetTimestamp() >= state.StartBy) throw new TimeoutException("Command expired before execution.");
++            var outcome = await _backend.ExecuteAsync(option, cancellation.Token).ConfigureAwait(false);
++            var status = cancellation.IsCancellationRequested ? "cancelled" : outcome.Status;
++            if (status is not ("succeeded" or "failed" or "cancelled" or "unknown"))
++                throw new InvalidOperationException("Backend returned a nonterminal outcome.");
++            result = ResultFor(state.Command.Value<string>("command_id")!, status, outcome.Reason, outcome.Evidence);
++        }
++        catch (Exception exception)
++        {
++            result = ResultFor(state.Command.Value<string>("command_id")!,
++                cancellation.IsCancellationRequested ? "cancelled" : "failed", exception.GetType().Name);
++        }
++        finally { ReleaseInputs(); }
++        lock (_gate)
++        {
++            if (_releaseFailed)
++                result = ResultFor(state.Command.Value<string>("command_id")!, "unknown", "input_release_failed");
++            else if (_halted || state.Command.Value<long>("control_generation") != _generation)
++                result = ResultFor(state.Command.Value<string>("command_id")!, "cancelled", "control_invalidated");
++            state.Result = result;
++            if (ReferenceEquals(_active, state))
++            {
++                _active = null;
++                _activeCancellation = null;
++            }
++        }
++        cancellation.Dispose();
++    }
++
++    private void ReleaseInputs()
++    {
++        try { _backend.ReleaseInputs(); }
++        catch (Exception)
++        {
++            lock (_gate)
++            {
++                _halted = true;
++                _generation++;
++                _releaseFailed = true;
++            }
++        }
++    }
++
++    private async Task WatchdogAsync()
++    {
++        using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(100));
++        try
++        {
++            while (await timer.WaitForNextTickAsync(_lifetime.Token).ConfigureAwait(false))
++            {
++                bool expired;
++                lock (_gate) expired = _active is not null && !_halted
++                    && Stopwatch.GetElapsedTime(_lastContact) > _leaseTimeout;
++                if (expired) Stop();
++            }
++        }
++        catch (OperationCanceledException) when (_lifetime.IsCancellationRequested) { }
++    }
++
++    private static bool Available(JObject option, JObject facts) =>
++        ((JObject)option["preconditions"]!).Properties()
++        .All(property => facts.TryGetValue(property.Name, out var value) && JToken.DeepEquals(value, property.Value));
++
++    private static JObject ResultFor(string identity, string status, string reason = "", JObject? evidence = null) =>
++        new() { ["command_id"] = identity, ["status"] = status, ["reason"] = reason,
++                ["evidence"] = evidence?.DeepClone() ?? new JObject() };
++
++    public async ValueTask DisposeAsync()
++    {
++        lock (_gate)
++        {
++            if (_disposed) return;
++            _disposed = true;
++        }
++        Stop();
++        _lifetime.Cancel();
++        await _watchdog.ConfigureAwait(false);
++        _lifetime.Dispose();
++        // A native skill owns the capture gate until it exits. Do not dispose
++        // synchronization primitives underneath a late native completion.
++    }
++}
+diff --git a/BetterGenshinImpact.AgentBridge/AgentPipeServer.cs b/BetterGenshinImpact.AgentBridge/AgentPipeServer.cs
+new file mode 100644
+--- /dev/null
++++ b/BetterGenshinImpact.AgentBridge/AgentPipeServer.cs
+@@ -0,0 +1,113 @@
++using System.Buffers.Binary;
++using System.IO.Pipes;
++using System.Text;
++using Newtonsoft.Json;
++using Newtonsoft.Json.Linq;
++
++namespace BetterGenshinImpact.AgentBridge;
++
++public static class AgentPipeProtocol
++{
++    public const int MaxPayloadBytes = 16 * 1024 * 1024;
++
++    public static async Task<JObject> ReadAsync(Stream stream, CancellationToken cancellationToken)
++    {
++        var header = new byte[4];
++        await stream.ReadExactlyAsync(header, cancellationToken).ConfigureAwait(false);
++        var count = BinaryPrimitives.ReadInt32LittleEndian(header);
++        if (count is <= 0 or > MaxPayloadBytes) throw new InvalidDataException("Invalid agent frame length.");
++        var payload = new byte[count];
++        await stream.ReadExactlyAsync(payload, cancellationToken).ConfigureAwait(false);
++        return JObject.Parse(new UTF8Encoding(false, true).GetString(payload));
++    }
++
++    public static async Task WriteAsync(Stream stream, JObject payload, CancellationToken cancellationToken)
++    {
++        var raw = Encoding.UTF8.GetBytes(payload.ToString(Formatting.None));
++        if (raw.Length is <= 0 or > MaxPayloadBytes) throw new InvalidDataException("Invalid agent frame length.");
++        var header = new byte[4];
++        BinaryPrimitives.WriteInt32LittleEndian(header, raw.Length);
++        await stream.WriteAsync(header, cancellationToken).ConfigureAwait(false);
++        await stream.WriteAsync(raw, cancellationToken).ConfigureAwait(false);
++        await stream.FlushAsync(cancellationToken).ConfigureAwait(false);
++    }
++}
++
++/// <summary>Per-user local IPC. A separate control pipe keeps stop independent of screenshots.</summary>
++public sealed class AgentPipeServer(AgentCommandHost host, string name) : IAsyncDisposable
++{
++    private readonly CancellationTokenSource _lifetime = new();
++    private readonly List<Task> _listeners = [];
++
++    public void Start()
++    {
++        if (!System.Text.RegularExpressions.Regex.IsMatch(name, "^[a-zA-Z0-9_.-]{1,100}$"))
++            throw new ArgumentException("Invalid agent pipe name.");
++        if (_listeners.Count != 0) throw new InvalidOperationException("Agent pipes are already running.");
++        // Multiple independent workers let status polling proceed during capture.
++        for (var index = 0; index < 4; index++) _listeners.Add(ListenAsync(name, false));
++        _listeners.Add(ListenAsync(name + ".control", true));
++    }
++
++    private async Task ListenAsync(string pipeName, bool controlOnly)
++    {
++        while (!_lifetime.IsCancellationRequested)
++        {
++            await using var pipe = new NamedPipeServerStream(pipeName, PipeDirection.InOut, 8,
++                PipeTransmissionMode.Byte, PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
++            try
++            {
++                await pipe.WaitForConnectionAsync(_lifetime.Token).ConfigureAwait(false);
++                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
++                timeout.CancelAfter(TimeSpan.FromSeconds(10));
++                var request = await AgentPipeProtocol.ReadAsync(pipe, timeout.Token).ConfigureAwait(false);
++                var identity = request.Value<string>("request_id");
++                JObject response;
++                try
++                {
++                    if (request.Value<int>("version") != 1 || string.IsNullOrWhiteSpace(identity))
++                        throw new ArgumentException("Invalid agent envelope.");
++                    var operation = request.Value<string>("operation");
++                    if (controlOnly && operation != "stop") throw new ArgumentException("Control pipe accepts stop only.");
++                    var data = request["data"] as JObject ?? new JObject();
++                    JToken result;
++                    switch (operation)
++                    {
++                        case "describe": result = host.Describe(); break;
++                        case "arm": host.Arm(); result = new JObject(); break;
++                        case "observe": result = await host.ObserveAsync(timeout.Token).ConfigureAwait(false); break;
++                        case "candidates": result = host.Candidates(data.Value<long>("frame_id")); break;
++                        case "start": result = await host.StartAsync(data, timeout.Token).ConfigureAwait(false); break;
++                        case "reconcile": result = host.Reconcile(data.Value<string>("command_id") ?? ""); break;
++                        case "cancel": result = host.Cancel(data.Value<string>("command_id") ?? ""); break;
++                        case "checkpoint": result = host.Checkpoint(data.Value<string>("command_id") ?? ""); break;
++                        case "stop": host.Stop(); result = new JObject(); break;
++                        default: throw new ArgumentException("Unsupported agent operation.");
++                    }
++                    response = new JObject { ["version"] = 1, ["request_id"] = identity,
++                                             ["success"] = true, ["data"] = result };
++                }
++                catch (Exception exception) when (exception is ArgumentException or InvalidOperationException
++                                                   or JsonException or IOException)
++                {
++                    response = new JObject { ["version"] = 1, ["request_id"] = identity,
++                                             ["success"] = false, ["error"] = exception.GetType().Name };
++                }
++                await AgentPipeProtocol.WriteAsync(pipe, response, timeout.Token).ConfigureAwait(false);
++            }
++            catch (Exception exception) when (exception is IOException or OperationCanceledException
++                                               or JsonException or DecoderFallbackException)
++            {
++                // A bad/disconnected client does not terminate the listener.
++            }
++        }
++    }
++
++    public async ValueTask DisposeAsync()
++    {
++        _lifetime.Cancel();
++        host.Stop();
++        await Task.WhenAll(_listeners).ConfigureAwait(false);
++        _lifetime.Dispose();
++    }
++}
+diff --git a/BetterGenshinImpact.AgentBridge/BetterGenshinImpact.AgentBridge.csproj b/BetterGenshinImpact.AgentBridge/BetterGenshinImpact.AgentBridge.csproj
+new file mode 100644
+index 00000000..dc33ff40
+--- /dev/null
++++ b/BetterGenshinImpact.AgentBridge/BetterGenshinImpact.AgentBridge.csproj
+@@ -0,0 +1,11 @@
++<Project Sdk="Microsoft.NET.Sdk">
++  <PropertyGroup>
++    <TargetFramework>net8.0</TargetFramework>
++    <ImplicitUsings>enable</ImplicitUsings>
++    <Nullable>enable</Nullable>
++    <LangVersion>12</LangVersion>
++  </PropertyGroup>
++  <ItemGroup>
++    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
++  </ItemGroup>
++</Project>
+diff --git a/BetterGenshinImpact/App.xaml.cs b/BetterGenshinImpact/App.xaml.cs
+index e301c68e..330986bb 100644
+--- a/BetterGenshinImpact/App.xaml.cs
++++ b/BetterGenshinImpact/App.xaml.cs
+@@ -161,6 +161,7 @@ public partial class App : Application
+                 services.AddHostedService(sp => sp.GetRequiredService<InstanceService>());
+                 // App Host
+                 services.AddHostedService<ApplicationHostService>();
++                services.AddHostedService<BetterGenshinImpact.Service.Agent.StartLuxAgentBridgeService>();
+                 // Page resolver service
+                 services.AddSingleton<INavigationService, NavigationService>();
+                 services.AddSingleton<IUpdateService, UpdateService>();
+diff --git a/BetterGenshinImpact/BetterGenshinImpact.csproj b/BetterGenshinImpact/BetterGenshinImpact.csproj
+index e27f6e7f..e512631d 100644
+--- a/BetterGenshinImpact/BetterGenshinImpact.csproj
++++ b/BetterGenshinImpact/BetterGenshinImpact.csproj
+@@ -1,5 +1,8 @@
+ <Project Sdk="Microsoft.NET.Sdk">
+ 
++	<ItemGroup>
++		<ProjectReference Include="..\BetterGenshinImpact.AgentBridge\BetterGenshinImpact.AgentBridge.csproj" />
++	</ItemGroup>
+ 	<PropertyGroup>
+ 		<AssemblyName>BetterGI</AssemblyName>
+ 		<Version>0.66.2-alpha.2</Version>
+diff --git a/BetterGenshinImpact/Service/Agent/AgentDailyJournal.cs b/BetterGenshinImpact/Service/Agent/AgentDailyJournal.cs
+new file mode 100644
+--- /dev/null
++++ b/BetterGenshinImpact/Service/Agent/AgentDailyJournal.cs
+@@ -0,0 +1,317 @@
++using System;
++using System.Collections.Generic;
++using System.IO;
++using System.Linq;
++using System.Security.Cryptography;
++using System.Text;
++using System.Threading;
++using System.Threading.Tasks;
++using BetterGenshinImpact.Core.Script;
++using BetterGenshinImpact.GameTask.Common;
++using BetterGenshinImpact.GameTask.Common.Job;
++using BetterGenshinImpact.Core.Recognition.OCR;
++using Microsoft.ClearScript;
++using Microsoft.ClearScript.V8;
++using Newtonsoft.Json.Linq;
++using OpenCvSharp;
++using BetterGenshinImpact.GameTask.AutoPathing;
++using BetterGenshinImpact.GameTask.AutoPathing.Model;
++using BetterGenshinImpact.GameTask.AutoTrackPath;
++using BetterGenshinImpact.GameTask.Common.BgiVision;
++
++namespace BetterGenshinImpact.Service.Agent;
++
++/// <summary>Per-session journal evidence. A route return never marks a quest done.</summary>
++public sealed class AgentDailyJournal
++{
++    private readonly object _gate = new();
++    private readonly Dictionary<string, byte[]> _resources;
++    private readonly int _timedRouteThreshold;
++    private JObject? _scope;
++    private JArray _rows = new();
++    private readonly Dictionary<int, JObject> _evidence = new();
++    private readonly Dictionary<string, string> _images = new();
++    private readonly Dictionary<int, JObject> _scanEvidence = new();
++    private readonly Dictionary<string, string> _scanImages = new();
++    private JObject? _reward;
++    private bool _needsScan = true;
++    private long _frame;
++    private int? _pendingVerification;
++
++    internal AgentDailyJournal(Dictionary<string, byte[]> resources, int timedRouteThreshold = 0)
++    {
++        _resources = resources;
++        _timedRouteThreshold = AgentTimedRoutePolicy.Validate(timedRouteThreshold);
++    }
++
++    internal (JObject Facts, string[] Images) Snapshot()
++    {
++        lock (_gate)
++        {
++            var valid = _rows.Count == 4 && _evidence.Count == 4;
++            var complete = !_needsScan && valid && _evidence.Values.All(e => e.Value<bool>("completed"));
++            var facts = new JObject
++            {
++                ["daily_needs_scan"] = _needsScan, ["daily_all_complete"] = complete,
++                ["daily_reward_claimed"] = _reward?.Value<bool>("claimed") == true,
++                ["daily_evidence"] = new JObject
++                {
++                    ["expected_quest_ids"] = new JArray(_rows.Select(r => $"{r["id"]}:{r["name"]}")),
++                    ["commissions"] = new JArray(_evidence.Values.Select(e => e.DeepClone())),
++                    ["reward"] = _reward?.DeepClone()
++                }
++            };
++            for (var slot = 1; slot <= 4; slot++)
++            {
++                var row = _rows.FirstOrDefault(r => r.Value<int>("id") == slot);
++                facts[$"daily_slot_{slot}_pending"] = !_needsScan && valid && row != null
++                    && _evidence.TryGetValue(slot, out var evidence) && !evidence.Value<bool>("completed")
++                    && row.Value<bool>("supported") && row.Value<string>("country") == "蒙德"
++                    && row.Value<string>("type") is "fight" or "talk"
++                    && !string.IsNullOrWhiteSpace(row.Value<string>("location"))
++                    && row.Value<string>("location") is not ("未知地点" or "识别失败" or "已完成");
++            }
++            return (facts, _images.Values.ToArray());
++        }
++    }
++
++    // Called synchronously from the trusted JS adapter while the row is visible.
++    public void Record(int slot, string status, Mat journalFrame)
++    {
++        if (slot is < 1 or > 4 || status is not ("completed" or "uncompleted")) return;
++        lock (_gate)
++        {
++            _scanEvidence[slot] = new JObject
++            {
++                ["completed"] = status == "completed",
++                ["evidence"] = VisualEvidence("commission_journal", journalFrame, _scanImages)
++            };
++        }
++    }
++
++    public void SetRows(string json)
++    {
++        var rows = JArray.Parse(json);
++        lock (_gate)
++        {
++            // Completed commissions move to the bottom of the handbook. Keep
++            // stable identities while binding each proof to its visible row.
++            // Commit only after all names and statuses have been validated.
++            var bound = AgentJournalRows.Bind(_rows, rows, _scanEvidence);
++            _rows = bound.Rows;
++            _evidence.Clear();
++            foreach (var pair in bound.Evidence) _evidence.Add(pair.Key, pair.Value);
++            _images.Clear();
++            foreach (var pair in _scanImages) _images.Add(pair.Key, pair.Value);
++            _needsScan = false;
++            if (_pendingVerification is int slot)
++            {
++                if (!_evidence.TryGetValue(slot, out var completed) || !completed.Value<bool>("completed"))
++                    throw new InvalidDataException("Selected commission did not become complete in the journal; no automatic retry.");
++                _pendingVerification = null;
++            }
++        }
++    }
++
++    public void RecordReward()
++    {
++        using var capture = TaskControl.CaptureToRectArea();
++        var text = OcrFactory.Paddle.Ocr(capture.SrcMat);
++        // Do not accept a random occurrence of 'claimed' outside the handbook.
++        if (!text.Contains("每日委托奖励", StringComparison.Ordinal)
++            || !text.Contains("今日奖励已领取", StringComparison.Ordinal))
++            throw new InvalidDataException("Daily reward claim could not be verified in the handbook.");
++        lock (_gate)
++            _reward = new JObject { ["claimed"] = true, ["primogems"] = null,
++                ["evidence"] = VisualEvidence("daily_reward_ui", capture.SrcMat) };
++    }
++
++    private JObject VisualEvidence(string source, Mat image, Dictionary<string, string>? images = null)
++    {
++        Cv2.ImEncode(".png", image, out var bytes);
++        var hash = Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
++        (images ?? _images)[hash] = "data:image/png;base64," + Convert.ToBase64String(bytes);
++        return new JObject { ["scope"] = _scope!.DeepClone(), ["frame_id"] = ++_frame,
++            ["screenshot_sha256"] = hash, ["source"] = source };
++    }
++
++    internal async Task ExecuteAsync(string skill, JObject arguments, JObject scope, CancellationToken ct)
++    {
++        JObject? quest = null;
++        bool firstScan = false;
++        lock (_gate)
++        {
++            if (_scope != null && !JToken.DeepEquals(_scope, scope))
++                throw new InvalidOperationException("Daily account or game day changed.");
++            _scope = (JObject)scope.DeepClone();
++            if (skill == "daily.scan")
++            {
++                firstScan = _rows.Count == 0;
++                _needsScan = true;
++                _scanEvidence.Clear(); _scanImages.Clear();
++                if (_reward != null) _reward = null;
++            }
++            else if (skill == "daily.execute")
++            {
++                var slot = arguments.Value<int>("slot");
++                if (Snapshot().Facts.Value<bool>($"daily_slot_{slot}_pending") != true)
++                    throw new InvalidOperationException("Commission is not available for execution.");
++                quest = (JObject)_rows.Single(r => r.Value<int>("id") == slot).DeepClone();
++                _needsScan = true;
++                _pendingVerification = slot;
++            }
++            else if (skill == "daily.claim")
++            {
++                if (Snapshot().Facts.Value<bool>("daily_all_complete") != true || _needsScan)
++                    throw new InvalidOperationException("Four completed commissions are required before claiming.");
++            }
++            else throw new InvalidDataException("Unsupported daily operation.");
++        }
++
++        if (firstScan)
++        {
++            // The model has selected the account/foreground-guarded scan skill.
++            // Recover this known free respawn screen before opening the journal.
++            using (var capture = TaskControl.CaptureToRectArea())
++            {
++                if (AgentRecoveryUi.IsColdDefeat(OcrFactory.Paddle.Ocr(capture.SrcMat)))
++                {
++                    ct.ThrowIfCancellationRequested();
++                    if (!Bv.ClickIfInReviveModal(capture))
++                        throw new InvalidOperationException("Cold defeat respawn button was not verified.");
++                    await Task.Delay(1500, ct);
++                }
++            }
++            await new ReturnMainUiTask().Start(ct);
++            bool ready = false;
++            for (var attempt = 0; attempt < 30; attempt++)
++            {
++                ct.ThrowIfCancellationRequested();
++                using var capture = TaskControl.CaptureToRectArea();
++                if (Bv.IsInMainUi(capture)
++                    && !AgentRecoveryUi.IsColdDefeat(OcrFactory.Paddle.Ocr(capture.SrcMat)))
++                { ready = true; break; }
++                await Task.Delay(500, ct);
++            }
++            if (!ready) throw new InvalidOperationException("Game did not leave the recovery/loading view.");
++            // Waiting for optimization can otherwise leave the party exposed
++            // to cold damage. Start the journal from the configured free statue.
++            await new TpTask(ct).TpToStatueOfTheSeven();
++        }
++
++        if (skill == "daily.claim")
++        {
++            // Reuse navigation only; upstream DoOnce also claims expeditions.
++            await new GoToAdventurersGuildTask().GoToAdventurersGuild("蒙德", ct);
++            var talk = new ChooseTalkOptionTask();
++            var selection = await talk.SingleSelectText("每日委托", ct, 5, true);
++            if (selection is not (TalkOptionRes.FoundAndClick or TalkOptionRes.FoundButNotOrange))
++                throw new InvalidOperationException("Daily reward dialogue option was not selected.");
++            await Task.Delay(800, ct);
++            if (selection == TalkOptionRes.FoundAndClick)
++            {
++                using var confirmation = TaskControl.CaptureToRectArea();
++                BetterGenshinImpact.GameTask.Common.BgiVision.Bv.ClickBlackConfirmButton(confirmation);
++                await Task.Delay(300, ct);
++            }
++            await talk.SelectLastOptionUntilEnd(ct, null, 3);
++            await new ReturnMainUiTask().Start(ct);
++        }
++
++        // Every operation starts from pinned bytes in a new working directory.
++        // Upstream's writable Data files are never reused as trusted game state.
++        var directory = Path.Combine(Path.GetTempPath(), "StartLux", Guid.NewGuid().ToString("N"));
++        Directory.CreateDirectory(directory);
++        try
++        {
++            foreach (var (name, bytes) in _resources.Where(p => p.Key.StartsWith("autocommission/", StringComparison.Ordinal)))
++            {
++                var target = Path.Combine(directory, name[15..]);
++                Directory.CreateDirectory(Path.GetDirectoryName(target)!);
++                await File.WriteAllBytesAsync(target, bytes, ct);
++            }
++            using var engine = new V8ScriptEngine(V8ScriptEngineFlags.UseCaseInsensitiveMemberBinding | V8ScriptEngineFlags.EnableTaskPromiseConversion);
++            EngineExtend.InitHost(engine, directory);
++            var scriptInput = new AgentScriptInput(
++                Core.Script.Dependence.GlobalMethod.KeyPress,
++                Core.Script.Dependence.GlobalMethod.KeyDown,
++                Core.Script.Dependence.GlobalMethod.KeyUp,
++                milliseconds =>
++                {
++                    if (ct.WaitHandle.WaitOne(milliseconds)) ct.ThrowIfCancellationRequested();
++                },
++                () =>
++                {
++                    ct.ThrowIfCancellationRequested();
++                    using var capture = TaskControl.CaptureToRectArea();
++                    return Bv.IsInTalkUi(capture);
++                },
++                quest?.Value<string>("type") == "talk");
++            engine.AddHostObject("keyPress", (Action<string>)scriptInput.Press);
++            // The standard JS wrapper catches path failures. Use a strict executor
++            // and retain its failure independently of upstream catch/continue code.
++            var routes = new AgentPinnedRoutes(_resources, ct, _timedRouteThreshold);
++            engine.AddHostObject("pathingScript", routes);
++            engine.AddHostObject("agentJournal", this);
++            engine.AddHostObject("settings", new PropertyBag
++            {
++                ["operation"] = skill == "daily.scan" ? "scan" : skill == "daily.claim" ? "reward-check" : "execute",
++                ["questJson"] = quest?.ToString(Newtonsoft.Json.Formatting.None) ?? "{}",
++                ["team"] = "", ["elementTeam"] = "", ["prepare"] = true,
++                ["skipRecognition"] = false, ["skipCommissions"] = ""
++            });
++            using var interrupt = ct.Register(() => { CancellationContext.Instance.Cts.Cancel(); engine.Interrupt(); });
++            ct.ThrowIfCancellationRequested();
++            if (engine.Evaluate(Encoding.UTF8.GetString(_resources["agent-main.js"])) is Task task) await task;
++            ct.ThrowIfCancellationRequested();
++            scriptInput.VerifyDialogue();
++            if (routes.Failed) throw new InvalidOperationException("A pinned commission route failed.");
++        }
++        finally
++        {
++            try { Directory.Delete(directory, true); } catch (IOException) { }
++        }
++    }
++}
++
++public sealed class AgentPinnedRoutes
++{
++    private readonly Dictionary<string, byte[]> _resources;
++    private readonly CancellationToken _token;
++    internal bool Failed { get; private set; }
++    private readonly int _timedRouteThreshold;
++    internal AgentPinnedRoutes(Dictionary<string, byte[]> resources, CancellationToken token, int timedRouteThreshold = 0)
++    { _resources = resources; _token = token; _timedRouteThreshold = AgentTimedRoutePolicy.Validate(timedRouteThreshold); }
++
++    internal static PathingTask ParseResource(byte[] bytes)
++    {
++        // Pinned resources retain their original bytes and hash. As with
++        // File.ReadAllText, consume the optional UTF-8 BOM before JSON parsing.
++        var offset = bytes.AsSpan().StartsWith(new byte[] { 0xEF, 0xBB, 0xBF }) ? 3 : 0;
++        return PathingTask.BuildFromJson(new UTF8Encoding(false, true).GetString(bytes, offset, bytes.Length - offset));
++    }
++
++    public async Task RunFile(string path)
++    {
++        try
++        {
++            _token.ThrowIfCancellationRequested();
++            var name = "autocommission/" + path.Replace('\\', '/');
++            if (!_resources.TryGetValue(name, out var bytes))
++                throw new InvalidDataException("Route is outside the pinned source pack.");
++            var route = ParseResource(bytes);
++            var executor = new PathExecutor(_token);
++            executor.PartyConfig.VerifiedCommissionCombat = true;
++            // Optional looting previously consumed 45 seconds in this timed
++            // commission. The override belongs only to this executor instance.
++            executor.PartyConfig.SuppressOptionalBattleLoot =
++                name.StartsWith("autocommission/assets/极速前进/", StringComparison.Ordinal);
++            if (executor.PartyConfig.SuppressOptionalBattleLoot)
++                executor.PartyConfig.TimedRouteSkipCombatBelowSeconds = _timedRouteThreshold;
++            await executor.Pathing(route);
++            _token.ThrowIfCancellationRequested();
++            if (!executor.SuccessEnd) throw new InvalidOperationException("Route did not complete.");
++        }
++        catch { Failed = true; throw; }
++    }
++}
+diff --git a/BetterGenshinImpact/Service/Agent/BetterGiAgentBackend.cs b/BetterGenshinImpact/Service/Agent/BetterGiAgentBackend.cs
+new file mode 100644
+--- /dev/null
++++ b/BetterGenshinImpact/Service/Agent/BetterGiAgentBackend.cs
+@@ -0,0 +1,304 @@
++using System;
++using System.Collections.Generic;
++using System.Globalization;
++using System.IO;
++using System.Linq;
++using System.Security.Cryptography;
++using System.Text;
++using System.Text.RegularExpressions;
++using System.Threading;
++using System.Threading.Tasks;
++using BetterGenshinImpact.AgentBridge;
++using BetterGenshinImpact.Core.Recognition.OCR;
++using BetterGenshinImpact.Core.Script;
++using BetterGenshinImpact.GameTask;
++using BetterGenshinImpact.GameTask.AutoPathing;
++using BetterGenshinImpact.GameTask.AutoPathing.Model;
++using BetterGenshinImpact.GameTask.Common;
++using BetterGenshinImpact.GameTask.Common.BgiVision;
++using BetterGenshinImpact.GameTask.Common.Job;
++using BetterGenshinImpact.Core.Input;
++using BetterGenshinImpact.Helpers;
++using Newtonsoft.Json.Linq;
++using OpenCvSharp;
++
++namespace BetterGenshinImpact.Service.Agent;
++
++/// <summary>Development execution adapter. Daily success remains externally verified.</summary>
++internal sealed class BetterGiAgentBackend : IAgentGameBackend
++{
++    private readonly JObject _binding;
++    private readonly Dictionary<string, byte[]> _resources = new(StringComparer.Ordinal);
++    private readonly SemaphoreSlim _captureGate = new(1, 1);
++    private int _ownsTask;
++    private readonly AgentDailyJournal _daily;
++    private readonly AgentVideoRecorder? _video;
++    internal JArray Options { get; }
++    internal JObject Metadata { get; }
++    internal event Action? ManualStop;
++
++    internal BetterGiAgentBackend(string configurationPath)
++    {
++        var configuration = JObject.Parse(File.ReadAllText(configurationPath));
++        _binding = (JObject)(configuration["binding"]?.DeepClone()
++                            ?? throw new InvalidDataException("Agent account binding is required."));
++        if (!Regex.IsMatch(_binding.Value<string>("account_id") ?? "", "^[0-9]{8,10}$")
++            || string.IsNullOrWhiteSpace(_binding.Value<string>("server_id"))
++            || _binding["server_utc_offset_minutes"]?.Type != JTokenType.Integer
++            || _binding.Value<int>("server_utc_offset_minutes") is < -720 or > 840)
++            throw new InvalidDataException("Invalid agent account/server binding.");
++        var packPath = configuration.Value<string>("pack_directory")
++                       ?? throw new InvalidDataException("Agent task pack directory is required.");
++        var root = Path.GetFullPath(Path.IsPathRooted(packPath) ? packPath
++            : Path.Combine(Path.GetDirectoryName(Path.GetFullPath(configurationPath))!, packPath));
++        if ((File.GetAttributes(root) & FileAttributes.ReparsePoint) != 0)
++            throw new InvalidDataException("Agent task pack cannot be a linked directory.");
++        var manifestRaw = File.ReadAllBytes(Path.Combine(root, "manifest.json"));
++        var manifest = JObject.Parse(Encoding.UTF8.GetString(manifestRaw));
++        if (manifest.Value<int>("schema_version") != 2 || manifest.Value<string>("game_id") != "genshin"
++            || manifest.Value<string>("environment") != "windows"
++            || manifest.Value<string>("release_status") != "development"
++            || string.IsNullOrWhiteSpace(manifest.Value<string>("decision_model")))
++            throw new InvalidDataException("Only an explicit Windows development task pack is supported.");
++        var totalBytes = 0L;
++        foreach (var property in ((JObject)(manifest["files"] ?? throw new InvalidDataException("Missing pack resources."))).Properties())
++        {
++            var name = property.Name;
++            if (name.Split('/').Any(part => string.IsNullOrEmpty(part) || part is "." or "..")
++                || name.Contains('\\') || name.Contains(':') || Path.IsPathRooted(name))
++                throw new InvalidDataException("Invalid agent resource path.");
++            var path = Path.GetFullPath(Path.Combine(root, name));
++            if (!path.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
++                throw new InvalidDataException("Agent resource escapes its pack.");
++            for (var cursor = path; !string.Equals(cursor, root, StringComparison.OrdinalIgnoreCase); cursor = Path.GetDirectoryName(cursor)!)
++                if ((File.GetAttributes(cursor) & FileAttributes.ReparsePoint) != 0)
++                    throw new InvalidDataException("Agent resources cannot contain links.");
++            var size = new FileInfo(path).Length;
++            totalBytes += size;
++            if (size > 32 * 1024 * 1024 || totalBytes > 64 * 1024 * 1024)
++                throw new InvalidDataException("Agent resources exceed the size budget.");
++            var bytes = File.ReadAllBytes(path);
++            if (!string.Equals(Convert.ToHexString(SHA256.HashData(bytes)), property.Value.Value<string>(), StringComparison.OrdinalIgnoreCase))
++                throw new InvalidDataException("Agent task pack resource hash mismatch.");
++            _resources.Add(name, bytes);
++        }
++        var routePolicy = configuration["timed_route_policy"] as JObject;
++        if (routePolicy != null && (routePolicy.Count != 1
++            || routePolicy["skip_optional_fights_below_seconds"]?.Type != JTokenType.Integer))
++            throw new InvalidDataException("Invalid bounded timed route policy.");
++        if (configuration["timed_route_policy"] != null && routePolicy == null)
++            throw new InvalidDataException("Timed route policy must be an object.");
++        var routeThreshold = AgentTimedRoutePolicy.Validate(
++            routePolicy?.Value<int>("skip_optional_fights_below_seconds") ?? 0);
++        _daily = new AgentDailyJournal(_resources, routeThreshold);
++        if (configuration.Value<bool?>("record_video") == true)
++        {
++            // Derive from the pinned pack's run directory; no arbitrary output target.
++            _video = new AgentVideoRecorder(Path.Combine(Path.GetDirectoryName(root)!, "video"), () =>
++            {
++                if (!SystemControl.IsGenshinImpactActiveByProcess())
++                    throw new InvalidOperationException("Game window lost foreground.");
++                using var region = TaskControl.CaptureToRectArea();
++                return region.SrcMat.Clone();
++            });
++            _video.Failed += () => ManualStop?.Invoke();
++        }
++        Options = JArray.Parse(Encoding.UTF8.GetString(_resources["actions.json"]));
++        foreach (var option in Options.Cast<JObject>())
++        {
++            var skill = option.Value<string>("skill");
++            if (skill is not ("observe.capture" or "path.run" or "dialogue.select" or "daily.scan" or "daily.execute" or "daily.claim"))
++                throw new InvalidDataException("Agent task pack references an unsupported native skill.");
++            if (skill != "observe.capture" && (option["preconditions"]?["account_verified"]?.Type != JTokenType.Boolean
++                || option["preconditions"]?.Value<bool>("account_verified") != true
++                || option["preconditions"]?.Value<bool>("foreground") != true))
++                throw new InvalidDataException("Input skills must guard the account and foreground window.");
++        }
++        Metadata = new JObject
++        {
++            ["protocol_version"] = 1, ["manifest_file_sha256"] = Convert.ToHexString(SHA256.HashData(manifestRaw)).ToLowerInvariant(),
++            ["decision_model"] = manifest["decision_model"]!.DeepClone(),
++            ["environment"] = "windows", ["release_status"] = "development",
++            ["timed_route_policy"] = new JObject { ["skip_optional_fights_below_seconds"] = routeThreshold },
++            ["game_video_v1"] = _video != null
++        };
++    }
++
++    public async Task<GameObservation> CaptureAsync(CancellationToken cancellationToken)
++    {
++        if (!TaskContext.Instance().IsInitialized)
++        {
++            var runtime = App.GetService<BetterGenshinImpact.GameTask.Runtime.GameRuntimeService>()
++                ?? throw new InvalidOperationException("Game runtime service is unavailable.");
++            if (!await runtime.StartAsync(cancellationToken).ConfigureAwait(false))
++                throw new InvalidOperationException("Could not initialize the game capture service.");
++        }
++        await _captureGate.WaitAsync(cancellationToken).ConfigureAwait(false);
++        try
++        {
++            if (SystemControl.IsGenshinImpactActiveByProcess()) _video?.Start();
++            return await Task.Run(() =>
++            {
++                cancellationToken.ThrowIfCancellationRequested();
++                if (!TaskContext.Instance().IsInitialized) throw new InvalidOperationException("Start the BetterGI capture service first.");
++                using var region = TaskControl.CaptureToRectArea();
++                var scene = Bv.WhichGameUi(region) switch
++                {
++                    GameUiCategory.Main => "world", GameUiCategory.Talk => "dialogue",
++                    GameUiCategory.BigMap => "map", _ => "unknown"
++                };
++                var text = OcrFactory.Paddle.Ocr(region.SrcMat);
++                if (AgentRecoveryUi.IsColdDefeat(text)) scene = "cold_defeat";
++                var width = region.SrcMat.Width;
++                var height = region.SrcMat.Height;
++                var uidWidth = Math.Min(width, 384);
++                var uidHeight = Math.Min(height, 80);
++                using var uidRegion = region.SrcMat.SubMat(new Rect(width - uidWidth, height - uidHeight, uidWidth, uidHeight));
++                var uidText = OcrFactory.Paddle.Ocr(uidRegion);
++                var uid = AgentUidRecognition.Read(uidText, text);
++                var accountVerified = uid.AccountId != null && uid.AccountId == _binding.Value<string>("account_id");
++                var serverTime = DateTimeOffset.UtcNow.ToOffset(TimeSpan.FromMinutes(_binding.Value<int>("server_utc_offset_minutes")));
++                var scope = new JObject
++                {
++                    ["account_id"] = uid.AccountId ?? _binding.Value<string>("account_id"),
++                    ["server_id"] = _binding.Value<string>("server_id"),
++                    ["game_day"] = serverTime.AddHours(-4).ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)
++                };
++                var facts = new JObject
++                {
++                    ["scene"] = scene, ["ocr_text"] = text, ["account_verified"] = accountVerified,
++                    ["uid_source"] = uid.Source,
++                    ["foreground"] = SystemControl.IsGenshinImpactActiveByProcess(),
++                    ["region"] = _binding.Value<string>("region"), ["region_source"] = "configured_task_region"
++                };
++                var daily = _daily.Snapshot();
++                facts.Merge(daily.Facts);
++                Cv2.ImEncode(".png", region.SrcMat, out var png);
++                cancellationToken.ThrowIfCancellationRequested();
++                return new GameObservation(scope, facts, new[] { "data:image/png;base64," + Convert.ToBase64String(png) }.Concat(daily.Images).Distinct().ToArray());
++            }, cancellationToken).ConfigureAwait(false);
++        }
++        finally { _captureGate.Release(); }
++    }
++
++    public async Task<SkillOutcome> ExecuteAsync(JObject option, CancellationToken cancellationToken)
++    {
++        if (option.Value<string>("skill") == "observe.capture")
++        {
++            var state = await CaptureAsync(cancellationToken).ConfigureAwait(false);
++            return new SkillOutcome("succeeded", "observation_captured", new JObject { ["facts"] = state.Facts });
++        }
++        if (!await TaskControl.TaskSemaphore.WaitAsync(0, cancellationToken).ConfigureAwait(false))
++            return new SkillOutcome("failed", "another_bettergi_task_owns_input", new JObject());
++        Interlocked.Exchange(ref _ownsTask, 1);
++        var runner = new TaskRunner();
++        var cancellationInitialized = false;
++        try
++        {
++            cancellationToken.ThrowIfCancellationRequested();
++            runner.Init();
++            CancellationContext.Instance.Set();
++            cancellationInitialized = true;
++            RunnerContext.Instance.Clear();
++            using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, CancellationContext.Instance.Cts.Token);
++            using var manualStop = CancellationContext.Instance.Cts.Token.Register(() =>
++            {
++                if (CancellationContext.Instance.IsManualStop) ManualStop?.Invoke();
++            });
++            var token = linked.Token;
++            token.ThrowIfCancellationRequested();
++            using var focusLease = CancellationTokenSource.CreateLinkedTokenSource(token);
++            var focusMonitor = MonitorForegroundAsync(focusLease.Token);
++            try
++            {
++                var arguments = option["arguments"] as JObject ?? new JObject();
++                if ((option.Value<string>("skill") ?? "").StartsWith("daily.", StringComparison.Ordinal))
++                {
++                    var current = await CaptureAsync(token).ConfigureAwait(false);
++                    await _daily.ExecuteAsync(option.Value<string>("skill")!, arguments, current.Scope, token).ConfigureAwait(false);
++                    var afterDaily = await CaptureAsync(token).ConfigureAwait(false);
++                    return new SkillOutcome("succeeded", "daily_operation_finished_requires_journal_evidence",
++                        new JObject { ["after_facts"] = afterDaily.Facts });
++                }
++                if (option.Value<string>("skill") == "path.run")
++                {
++                    var resource = arguments.Value<string>("route") ?? "";
++                    if (!_resources.TryGetValue(resource, out var bytes)) throw new InvalidDataException("Route is outside the pinned task pack.");
++                    var task = AgentPinnedRoutes.ParseResource(bytes);
++                    var executor = new PathExecutor(token);
++                    token.ThrowIfCancellationRequested();
++                    await executor.Pathing(task).ConfigureAwait(false);
++                    token.ThrowIfCancellationRequested();
++                    if (!executor.SuccessEnd) return new SkillOutcome("failed", "path_executor_did_not_complete", new JObject());
++                }
++                else if (option.Value<string>("skill") == "dialogue.select")
++                {
++                    var text = arguments.Value<string>("text");
++                    if (string.IsNullOrWhiteSpace(text) || text.Length > 128) throw new InvalidDataException("Invalid dialogue text.");
++                    token.ThrowIfCancellationRequested();
++                    var result = await new ChooseTalkOptionTask().SingleSelectText(text, token, 3, true).ConfigureAwait(false);
++                    if (result != TalkOptionRes.FoundAndClick) return new SkillOutcome("failed", "dialogue_option_not_selected", new JObject());
++                }
++                else throw new InvalidDataException("Unsupported input skill.");
++
++                // Native execution and independent postcondition verification are separate.
++                await Task.Delay(150, token).ConfigureAwait(false);
++                var after = await CaptureAsync(token).ConfigureAwait(false);
++                var expectedText = arguments.Value<string>("verify_text");
++                var verified = !string.IsNullOrWhiteSpace(expectedText) && expectedText.Length <= 128
++                               && (after.Facts.Value<string>("ocr_text") ?? "").Contains(expectedText, StringComparison.Ordinal);
++                return new SkillOutcome(verified ? "succeeded" : "unknown",
++                    verified ? "visual_text_postcondition_observed" : "native_returned_postcondition_unverified",
++                    new JObject { ["execution_completed"] = true, ["visual_postcondition_verified"] = verified,
++                                  ["commission_completion_verified"] = false, ["daily_reward_verified"] = false,
++                                  ["after_facts"] = after.Facts });
++            }
++            finally
++            {
++                focusLease.Cancel();
++                await focusMonitor.ConfigureAwait(false);
++            }
++        }
++        finally
++        {
++            try
++            {
++                runner.End();
++                if (cancellationInitialized) CancellationContext.Instance.Clear();
++                RunnerContext.Instance.Clear();
++            }
++            finally
++            {
++                ReleaseInputs();
++                Interlocked.Exchange(ref _ownsTask, 0);
++                TaskControl.TaskSemaphore.Release();
++            }
++        }
++    }
++
++    public void ReleaseInputs()
++    {
++        // Do not release keys owned by an unrelated BetterGI task after a busy rejection.
++        if (Volatile.Read(ref _ownsTask) != 0) InputHub.ReleaseAll();
++    }
++
++    internal async ValueTask StopRecordingAsync()
++    {
++        if (_video != null) await _video.DisposeAsync().ConfigureAwait(false);
++    }
++
++    private async Task MonitorForegroundAsync(CancellationToken cancellationToken)
++    {
++        using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(100));
++        try
++        {
++            while (await timer.WaitForNextTickAsync(cancellationToken).ConfigureAwait(false))
++            {
++                if (SystemControl.IsGenshinImpactActiveByProcess()) continue;
++                ManualStop?.Invoke();
++                return;
++            }
++        }
++        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
++    }
++}
+diff --git a/BetterGenshinImpact/Service/Agent/StartLuxAgentBridgeService.cs b/BetterGenshinImpact/Service/Agent/StartLuxAgentBridgeService.cs
+new file mode 100644
+--- /dev/null
++++ b/BetterGenshinImpact/Service/Agent/StartLuxAgentBridgeService.cs
+@@ -0,0 +1,43 @@
++using System;
++using System.Threading;
++using System.Threading.Tasks;
++using BetterGenshinImpact.AgentBridge;
++using Microsoft.Extensions.Hosting;
++using Microsoft.Extensions.Logging;
++
++namespace BetterGenshinImpact.Service.Agent;
++
++public sealed class StartLuxAgentBridgeService(ILogger<StartLuxAgentBridgeService> logger) : IHostedService
++{
++    private AgentCommandHost? _host;
++    private AgentPipeServer? _server;
++    private BetterGiAgentBackend? _backend;
++
++    public Task StartAsync(CancellationToken cancellationToken)
++    {
++        var configuration = Environment.GetEnvironmentVariable("STARTLUX_AGENT_CONFIG");
++        if (string.IsNullOrWhiteSpace(configuration)) return Task.CompletedTask;
++        var backend = new BetterGiAgentBackend(configuration);
++        _backend = backend;
++        _host = new AgentCommandHost(backend, backend.Options, metadata: backend.Metadata);
++        backend.ManualStop += _host.Stop;
++        var pipeName = Environment.GetEnvironmentVariable("STARTLUX_AGENT_PIPE") ?? "startlux-genshin";
++        _server = new AgentPipeServer(_host, pipeName);
++        _server.Start();
++        logger.LogInformation("StartLux development agent bridge started on local pipe {PipeName}", pipeName);
++        return Task.CompletedTask;
++    }
++
++    public async Task StopAsync(CancellationToken cancellationToken)
++    {
++        try
++        {
++            if (_server is not null) await _server.DisposeAsync();
++            if (_host is not null) await _host.DisposeAsync();
++        }
++        finally
++        {
++            if (_backend is not null) await _backend.StopRecordingAsync();
++        }
++    }
++}
+diff --git a/Test/BetterGenshinImpact.AgentBridge.Fixture/BetterGenshinImpact.AgentBridge.Fixture.csproj b/Test/BetterGenshinImpact.AgentBridge.Fixture/BetterGenshinImpact.AgentBridge.Fixture.csproj
+new file mode 100644
+index 00000000..403fa84c
+--- /dev/null
++++ b/Test/BetterGenshinImpact.AgentBridge.Fixture/BetterGenshinImpact.AgentBridge.Fixture.csproj
+@@ -0,0 +1,11 @@
++<Project Sdk="Microsoft.NET.Sdk">
++  <PropertyGroup>
++    <OutputType>Exe</OutputType>
++    <TargetFramework>net8.0</TargetFramework>
++    <ImplicitUsings>enable</ImplicitUsings>
++    <Nullable>enable</Nullable>
++  </PropertyGroup>
++  <ItemGroup>
++    <ProjectReference Include="../../BetterGenshinImpact.AgentBridge/BetterGenshinImpact.AgentBridge.csproj" />
++  </ItemGroup>
++</Project>
+diff --git a/Test/BetterGenshinImpact.AgentBridge.Fixture/Program.cs b/Test/BetterGenshinImpact.AgentBridge.Fixture/Program.cs
+new file mode 100644
+index 00000000..0b8adab3
+--- /dev/null
++++ b/Test/BetterGenshinImpact.AgentBridge.Fixture/Program.cs
+@@ -0,0 +1,51 @@
++using BetterGenshinImpact.AgentBridge;
++using Newtonsoft.Json;
++using Newtonsoft.Json.Linq;
++
++if (args.Length != 1) throw new ArgumentException("A fixture pipe name is required.");
++var backend = new FixtureBackend();
++var options = JArray.Parse("""
++    [{"id":"talk","label":"Talk to Katheryne","skill":"dialogue","skill_version":"1",
++      "arguments":{"target":"katheryne"},
++      "preconditions":{"scene":"world","target":"katheryne","region":"mondstadt"},
++      "timeout_ms":30000,"ttl_ms":3000}]
++    """);
++await using var host = new AgentCommandHost(backend, options);
++await using var server = new AgentPipeServer(host, args[0]);
++server.Start();
++Console.WriteLine(JsonConvert.SerializeObject(new
++{
++    ready = true, synthetic_fixture = true,
++    unix_pipe_path = Path.Combine(Path.GetTempPath(), "CoreFxPipe_" + args[0])
++}));
++await Console.In.ReadLineAsync();
++
++internal sealed class FixtureBackend : IAgentGameBackend
++{
++    private readonly object _gate = new();
++    private int _executions;
++
++    public Task<GameObservation> CaptureAsync(CancellationToken cancellationToken)
++    {
++        lock (_gate)
++        {
++            var scope = JObject.Parse("""{"account_id":"fixture-account","server_id":"fixture-server","game_day":"2026-10-18"}""");
++            var facts = new JObject { ["scene"] = "world", ["target"] = _executions == 0 ? "katheryne" : "none",
++                                      ["region"] = "mondstadt" };
++            return Task.FromResult(new GameObservation(scope, facts, []));
++        }
++    }
++
++    public Task<SkillOutcome> ExecuteAsync(JObject option, CancellationToken cancellationToken)
++    {
++        cancellationToken.ThrowIfCancellationRequested();
++        lock (_gate)
++        {
++            _executions++;
++            return Task.FromResult(new SkillOutcome("succeeded", "synthetic_fixture",
++                new JObject { ["synthetic_fixture"] = true, ["executions"] = _executions }));
++        }
++    }
++
++    public void ReleaseInputs() { }
++}
+diff --git a/Test/BetterGenshinImpact.AgentBridge.Tests/AgentBridgeTests.cs b/Test/BetterGenshinImpact.AgentBridge.Tests/AgentBridgeTests.cs
+new file mode 100644
+--- /dev/null
++++ b/Test/BetterGenshinImpact.AgentBridge.Tests/AgentBridgeTests.cs
+@@ -0,0 +1,241 @@
++using System.Buffers.Binary;
++using BetterGenshinImpact.AgentBridge;
++using Newtonsoft.Json.Linq;
++using Xunit;
++
++namespace BetterGenshinImpact.AgentBridge.Tests;
++
++public sealed class AgentBridgeTests
++{
++    private static readonly JObject Option = JObject.Parse("""
++        {"id":"talk","label":"Talk","skill":"dialogue.select","skill_version":"1",
++         "arguments":{"text":"Katheryne"},"preconditions":{"scene":"world","account_verified":true},
++         "ttl_ms":3000,"timeout_ms":30000}
++        """);
++
++    private sealed class Backend : IAgentGameBackend
++    {
++        internal JObject Scope = JObject.Parse("""{"account_id":"fixture","server_id":"fixture","game_day":"2026-10-18"}""");
++        internal JObject Facts = JObject.Parse("""{"scene":"world","account_verified":true}""");
++        internal readonly TaskCompletionSource Started = new(TaskCreationOptions.RunContinuationsAsynchronously);
++        internal readonly TaskCompletionSource Cancelled = new(TaskCreationOptions.RunContinuationsAsynchronously);
++        internal TaskCompletionSource? CaptureEntered;
++        internal TaskCompletionSource? FinishCapture;
++        internal int Calls;
++        internal int Releases;
++        internal bool ThrowOnRelease;
++
++        public async Task<GameObservation> CaptureAsync(CancellationToken cancellationToken)
++        {
++            if (CaptureEntered is not null)
++            {
++                CaptureEntered.TrySetResult();
++                await FinishCapture!.Task.WaitAsync(cancellationToken);
++            }
++            return new GameObservation((JObject)Scope.DeepClone(), (JObject)Facts.DeepClone(), []);
++        }
++
++        public async Task<SkillOutcome> ExecuteAsync(JObject option, CancellationToken cancellationToken)
++        {
++            Interlocked.Increment(ref Calls);
++            Started.TrySetResult();
++            using var registration = cancellationToken.Register(() => Cancelled.TrySetResult());
++            await Task.Delay(Timeout.Infinite, cancellationToken);
++            return new SkillOutcome("succeeded", "fixture", new JObject());
++        }
++
++        public void ReleaseInputs()
++        {
++            Interlocked.Increment(ref Releases);
++            if (ThrowOnRelease) throw new IOException("Fixture release failure");
++        }
++    }
++
++    private static JObject Command(JObject observation, string id = "command-1", JObject? option = null) => new()
++    {
++        ["command_id"] = id, ["request_id"] = "decision-1",
++        ["session_id"] = observation["session_id"]!.DeepClone(),
++        ["scope"] = observation["scope"]!.DeepClone(),
++        ["control_generation"] = observation["control_generation"]!.DeepClone(),
++        ["source_frame_id"] = observation["frame_id"]!.DeepClone(),
++        ["basis_hash"] = "fixture", ["catalog_hash"] = "fixture", ["remaining_ttl_ms"] = 3000,
++        ["option"] = option?.DeepClone() ?? Option.DeepClone(),
++        ["origin"] = "decision", ["action_granularity"] = "skill"
++    };
++
++    [Fact]
++    public async Task DeadlineCheckpointPreservesGenerationAndCannotUndoManualStop()
++    {
++        var backend = new Backend();
++        var option = (JObject)Option.DeepClone();
++        option["skill"] = "daily.execute";
++        option["timeout_ms"] = 100;
++        await using var host = new AgentCommandHost(backend, new JArray(option));
++        host.Arm();
++        var before = await host.ObserveAsync(CancellationToken.None);
++        await host.StartAsync(Command(before, option: option), CancellationToken.None);
++        await backend.Started.Task.WaitAsync(TimeSpan.FromSeconds(2));
++        Assert.Equal("checkpoint_before_deadline", host.Checkpoint("command-1").Value<string>("reason"));
++        await backend.Cancelled.Task.WaitAsync(TimeSpan.FromSeconds(2));
++        JObject result;
++        do
++        {
++            await Task.Delay(10);
++            result = host.Checkpoint("command-1");
++        } while (result.Value<string>("status") == "running");
++        Assert.Equal("cancelled", result.Value<string>("status"));
++        var after = await host.ObserveAsync(CancellationToken.None);
++        Assert.Equal(before.Value<long>("control_generation"), after.Value<long>("control_generation"));
++        Assert.True(backend.Releases > 0);
++        host.Stop();
++        Assert.Equal("unknown", host.Checkpoint("command-1").Value<string>("status"));
++        Assert.True((await host.ObserveAsync(CancellationToken.None)).Value<long>("control_generation")
++                    > before.Value<long>("control_generation"));
++    }
++
++    [Fact]
++    public async Task CheckpointRejectsOtherSkillsAndUnknownCommands()
++    {
++        var backend = new Backend();
++        await using var host = new AgentCommandHost(backend, new JArray(Option));
++        host.Arm();
++        var state = await host.ObserveAsync(CancellationToken.None);
++        await host.StartAsync(Command(state), CancellationToken.None);
++        Assert.Equal("unknown", host.Checkpoint("command-1").Value<string>("status"));
++        Assert.Equal("unknown", host.Checkpoint("missing").Value<string>("status"));
++        Assert.False(backend.Cancelled.Task.IsCompleted);
++    }
++
++    [Fact]
++    public async Task DuplicateCommandIsNotExecutedTwice()
++    {
++        var backend = new Backend();
++        await using var host = new AgentCommandHost(backend, new JArray(Option));
++        host.Arm();
++        var state = await host.ObserveAsync(CancellationToken.None);
++        var command = Command(state);
++        Assert.Equal("running", (await host.StartAsync(command, CancellationToken.None)).Value<string>("status"));
++        Assert.Equal("running", (await host.StartAsync(command, CancellationToken.None)).Value<string>("status"));
++        await backend.Started.Task.WaitAsync(TimeSpan.FromSeconds(2));
++        Assert.Equal(1, backend.Calls);
++        var changed = (JObject)command.DeepClone();
++        changed["option"]!["arguments"]!["text"] = "Another target";
++        await Assert.ThrowsAsync<ArgumentException>(() => host.StartAsync(changed, CancellationToken.None));
++    }
++
++    [Fact]
++    public async Task ChangedGuardOrActionArgumentsCannotExecute()
++    {
++        var backend = new Backend();
++        await using var host = new AgentCommandHost(backend, new JArray(Option));
++        host.Arm();
++        var state = await host.ObserveAsync(CancellationToken.None);
++        var changed = (JObject)Option.DeepClone();
++        changed["arguments"]!["text"] = "Another target";
++        Assert.Equal("cancelled", (await host.StartAsync(Command(state, option: changed), CancellationToken.None)).Value<string>("status"));
++        backend.Facts["scene"] = "map";
++        Assert.Equal("cancelled", (await host.StartAsync(Command(state), CancellationToken.None)).Value<string>("status"));
++        Assert.Equal(0, backend.Calls);
++    }
++
++    [Fact]
++    public async Task StopDuringCaptureInvalidatesQueuedCommandWithoutWaitingForCapture()
++    {
++        var backend = new Backend();
++        await using var host = new AgentCommandHost(backend, new JArray(Option));
++        host.Arm();
++        var state = await host.ObserveAsync(CancellationToken.None);
++        backend.CaptureEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
++        backend.FinishCapture = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
++        var pending = host.StartAsync(Command(state), CancellationToken.None);
++        await backend.CaptureEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
++        host.Stop();
++        Assert.True(backend.Releases > 0);
++        backend.FinishCapture.TrySetResult();
++        Assert.Equal("cancelled", (await pending).Value<string>("status"));
++        Assert.Equal(0, backend.Calls);
++    }
++
++    [Fact]
++    public async Task OnlyOneInputLeaseCanExecute()
++    {
++        var backend = new Backend();
++        await using var host = new AgentCommandHost(backend, new JArray(Option));
++        host.Arm();
++        var state = await host.ObserveAsync(CancellationToken.None);
++        await host.StartAsync(Command(state), CancellationToken.None);
++        await backend.Started.Task.WaitAsync(TimeSpan.FromSeconds(2));
++        Assert.Equal("cancelled", (await host.StartAsync(Command(state, "second"), CancellationToken.None)).Value<string>("status"));
++        Assert.Equal(1, backend.Calls);
++        host.Stop();
++        await backend.Cancelled.Task.WaitAsync(TimeSpan.FromSeconds(2));
++        Assert.True(backend.Releases > 0);
++    }
++
++    [Fact]
++    public async Task AccountSwitchRequiresExplicitRearm()
++    {
++        var backend = new Backend();
++        await using var host = new AgentCommandHost(backend, new JArray(Option));
++        host.Arm();
++        var before = await host.ObserveAsync(CancellationToken.None);
++        backend.Scope["account_id"] = "other";
++        var after = await host.ObserveAsync(CancellationToken.None);
++        Assert.Empty(host.Candidates(after.Value<long>("frame_id")));
++        Assert.True(after.Value<long>("control_generation") > before.Value<long>("control_generation"));
++        Assert.Equal("cancelled", (await host.StartAsync(Command(before), CancellationToken.None)).Value<string>("status"));
++        Assert.Equal(0, backend.Calls);
++    }
++
++    [Fact]
++    public async Task LocalWatchdogCancelsWhenTheAgentStopsPolling()
++    {
++        var backend = new Backend();
++        await using var host = new AgentCommandHost(backend, new JArray(Option), TimeSpan.FromMilliseconds(50));
++        host.Arm();
++        var state = await host.ObserveAsync(CancellationToken.None);
++        await host.StartAsync(Command(state), CancellationToken.None);
++        await backend.Started.Task.WaitAsync(TimeSpan.FromSeconds(2));
++        await backend.Cancelled.Task.WaitAsync(TimeSpan.FromSeconds(2));
++        Assert.True(backend.Releases > 0);
++    }
++
++    [Fact]
++    public async Task SkillTimeoutIsEnforcedWithoutPython()
++    {
++        var backend = new Backend();
++        var option = (JObject)Option.DeepClone();
++        option["timeout_ms"] = 100;
++        await using var host = new AgentCommandHost(backend, new JArray(option));
++        host.Arm();
++        var state = await host.ObserveAsync(CancellationToken.None);
++        await host.StartAsync(Command(state, option: option), CancellationToken.None);
++        await backend.Started.Task.WaitAsync(TimeSpan.FromSeconds(2));
++        await backend.Cancelled.Task.WaitAsync(TimeSpan.FromSeconds(2));
++        Assert.True(backend.Releases > 0);
++    }
++
++    [Fact]
++    public async Task FailedInputReleasePreventsRearming()
++    {
++        var backend = new Backend { ThrowOnRelease = true };
++        await using var host = new AgentCommandHost(backend, new JArray(Option));
++        host.Stop();
++        Assert.Throws<InvalidOperationException>(() => host.Arm());
++    }
++
++    [Fact]
++    public async Task FramingPreservesUnicodeAndRejectsTruncatedOrOversizedPayloads()
++    {
++        await using var stream = new MemoryStream();
++        var message = new JObject { ["text"] = "领取每日奖励", ["value"] = 0, ["unknown"] = null };
++        await AgentPipeProtocol.WriteAsync(stream, message, CancellationToken.None);
++        stream.Position = 0;
++        Assert.True(JToken.DeepEquals(message, await AgentPipeProtocol.ReadAsync(stream, CancellationToken.None)));
++        var header = new byte[4];
++        BinaryPrimitives.WriteInt32LittleEndian(header, AgentPipeProtocol.MaxPayloadBytes + 1);
++        await Assert.ThrowsAsync<InvalidDataException>(() => AgentPipeProtocol.ReadAsync(new MemoryStream(header), CancellationToken.None));
++        BinaryPrimitives.WriteInt32LittleEndian(header, 10);
++        await Assert.ThrowsAsync<EndOfStreamException>(() => AgentPipeProtocol.ReadAsync(new MemoryStream(header), CancellationToken.None));
++    }
++}
+diff --git a/Test/BetterGenshinImpact.AgentBridge.Tests/BetterGenshinImpact.AgentBridge.Tests.csproj b/Test/BetterGenshinImpact.AgentBridge.Tests/BetterGenshinImpact.AgentBridge.Tests.csproj
+new file mode 100644
+--- /dev/null
++++ b/Test/BetterGenshinImpact.AgentBridge.Tests/BetterGenshinImpact.AgentBridge.Tests.csproj
+@@ -0,0 +1,22 @@
++<Project Sdk="Microsoft.NET.Sdk">
++  <PropertyGroup>
++    <TargetFramework>net8.0</TargetFramework>
++    <ImplicitUsings>enable</ImplicitUsings>
++    <Nullable>enable</Nullable>
++    <IsTestProject>true</IsTestProject>
++    <IsPackable>false</IsPackable>
++  </PropertyGroup>
++  <ItemGroup>
++    <Compile Include="../../BetterGenshinImpact/Service/Agent/AgentUidRecognition.cs" Link="AgentUidRecognition.cs" />
++    <Compile Include="../../BetterGenshinImpact/Service/Agent/AgentJournalRows.cs" Link="AgentJournalRows.cs" />
++    <Compile Include="../../BetterGenshinImpact/Service/Agent/AgentRecoveryUi.cs" Link="AgentRecoveryUi.cs" />
++    <Compile Include="../../BetterGenshinImpact/Service/Agent/AgentScriptInput.cs" Link="AgentScriptInput.cs" />
++    <Compile Include="../../BetterGenshinImpact/Service/Agent/AgentTimedRoutePolicy.cs" Link="AgentTimedRoutePolicy.cs" />
++    <Compile Include="../../BetterGenshinImpact/Service/Agent/AgentVideoRecorder.cs" Link="AgentVideoRecorder.cs" />
++    <PackageReference Include="OpenCvSharp4.Windows" Version="4.11.0.20250507" />
++    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.8.0" />
++    <PackageReference Include="xunit" Version="2.5.3" />
++    <PackageReference Include="xunit.runner.visualstudio" Version="2.5.3" />
++    <ProjectReference Include="../../BetterGenshinImpact.AgentBridge/BetterGenshinImpact.AgentBridge.csproj" />
++  </ItemGroup>
++</Project>
+diff --git a/BetterGenshinImpact/Service/Agent/AgentUidRecognition.cs b/BetterGenshinImpact/Service/Agent/AgentUidRecognition.cs
+new file mode 100644
+--- /dev/null
++++ b/BetterGenshinImpact/Service/Agent/AgentUidRecognition.cs
+@@ -0,0 +1,24 @@
++using System;
++using System.Linq;
++using System.Text.RegularExpressions;
++
++namespace BetterGenshinImpact.Service.Agent;
++
++internal static class AgentUidRecognition
++{
++    internal static (string? AccountId, string Source) Read(string focusedText, string fullText)
++    {
++        // In the dedicated bottom-right region Paddle may omit the narrow I.
++        // Digits must remain exact; bare numbers are never an account identity.
++        var focused = Extract(focusedText, @"\bU\s*[I1l|]?\s*D\s*[:：]?\s*(\d{8,10})(?!\d)");
++        if (focused.Length == 1) return (focused[0], "bottom_right_ocr");
++        if (focused.Length > 1) return (null, "conflicting_uid");
++        var fallback = Extract(fullText, @"\bUID\s*[:：]?\s*(\d{8,10})(?!\d)");
++        return fallback.Length == 1 ? (fallback[0], "full_frame_ocr")
++            : (null, fallback.Length > 1 ? "conflicting_uid" : "unreadable");
++    }
++
++    private static string[] Extract(string text, string pattern) => Regex.Matches(text, pattern,
++        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant).Cast<Match>()
++        .Select(match => match.Groups[1].Value).Distinct(StringComparer.Ordinal).ToArray();
++}
+diff --git a/Test/BetterGenshinImpact.AgentBridge.Tests/AgentUidRecognitionTests.cs b/Test/BetterGenshinImpact.AgentBridge.Tests/AgentUidRecognitionTests.cs
+new file mode 100644
+--- /dev/null
++++ b/Test/BetterGenshinImpact.AgentBridge.Tests/AgentUidRecognitionTests.cs
+@@ -0,0 +1,40 @@
++using BetterGenshinImpact.Service.Agent;
++using Xunit;
++
++public class AgentUidRecognitionTests
++{
++    [Theory]
++    [InlineData("UID:123456789")]
++    [InlineData("Q\nE\nUD:123456789")]
++    [InlineData("U1D：123456789")]
++    [InlineData("U I D 123456789")]
++    public void FocusedBannerRetainsExactDigits(string text)
++    {
++        var result = AgentUidRecognition.Read(text, "");
++        Assert.Equal("123456789", result.AccountId);
++        Assert.Equal("bottom_right_ocr", result.Source);
++    }
++
++    [Theory]
++    [InlineData("123456789")]
++    [InlineData("UID:1234567")]
++    [InlineData("UID:12345678999")]
++    [InlineData("GUID:123456789")]
++    public void UnlabelledOrInvalidNumbersCannotVerifyAnAccount(string text)
++        => Assert.Null(AgentUidRecognition.Read(text, "").AccountId);
++
++    [Fact]
++    public void ConflictingFocusedBannersDoNotUseAConvenientFallback()
++        => Assert.Null(AgentUidRecognition.Read("UID:123456789\nUID:999999999", "UID:123456789").AccountId);
++
++    [Fact]
++    public void ActiveAccountBannerTakesPrecedenceOverAnotherProfileInTheFullFrame()
++        => Assert.Equal("123456789", AgentUidRecognition.Read("UID:123456789", "UID:999999999").AccountId);
++
++    [Fact]
++    public void FullFrameFallbackRequiresOneUnambiguousLabelledUid()
++    {
++        Assert.Equal("full_frame_ocr", AgentUidRecognition.Read("", "UID:123456789").Source);
++        Assert.Null(AgentUidRecognition.Read("", "UID:123456789\nUID:999999999").AccountId);
++    }
++}
+diff --git a/BetterGenshinImpact/Service/Agent/AgentJournalRows.cs b/BetterGenshinImpact/Service/Agent/AgentJournalRows.cs
+new file mode 100644
+--- /dev/null
++++ b/BetterGenshinImpact/Service/Agent/AgentJournalRows.cs
+@@ -0,0 +1,43 @@
++using System;
++using System.Collections.Generic;
++using System.IO;
++using System.Linq;
++using Newtonsoft.Json.Linq;
++
++namespace BetterGenshinImpact.Service.Agent;
++
++/// <summary>Bind changing handbook positions to stable commission identities.</summary>
++internal static class AgentJournalRows
++{
++    internal static (JArray Rows, Dictionary<int, JObject> Evidence) Bind(
++        JArray previous, JArray observed, IReadOnlyDictionary<int, JObject> observations)
++    {
++        if (observed.Count != 4
++            || !observed.Select(r => r.Value<int>("id")).Order().SequenceEqual(new[] { 1, 2, 3, 4 })
++            || observed.Any(r => string.IsNullOrWhiteSpace(r.Value<string>("name")))
++            || observed.Select(r => r.Value<string>("name")).Distinct(StringComparer.Ordinal).Count() != 4)
++            throw new InvalidDataException("All four unique journal identities must be recognized.");
++
++        var identities = (previous.Count == 0 ? observed : previous)
++            .ToDictionary(r => r.Value<string>("name")!, r => r.Value<int>("id"), StringComparer.Ordinal);
++        if (identities.Count != 4 || observed.Any(r => !identities.ContainsKey(r.Value<string>("name")!)))
++            throw new InvalidDataException("Journal identities changed; manual review is required.");
++
++        var rows = new List<JObject>();
++        var evidence = new Dictionary<int, JObject>();
++        foreach (var observedRow in observed)
++        {
++            var visibleSlot = observedRow.Value<int>("id");
++            if (!observations.TryGetValue(visibleSlot, out var observation))
++                throw new InvalidDataException("Each journal row requires an unambiguous visual status.");
++            var row = (JObject)observedRow.DeepClone();
++            var stableSlot = identities[row.Value<string>("name")!];
++            row["id"] = stableSlot;
++            var proof = (JObject)observation.DeepClone();
++            proof["quest_id"] = $"{stableSlot}:{row["name"]}";
++            rows.Add(row);
++            evidence.Add(stableSlot, proof);
++        }
++        return (new JArray(rows.OrderBy(r => r.Value<int>("id"))), evidence);
++    }
++}
+diff --git a/Test/BetterGenshinImpact.AgentBridge.Tests/AgentJournalRowsTests.cs b/Test/BetterGenshinImpact.AgentBridge.Tests/AgentJournalRowsTests.cs
+new file mode 100644
+--- /dev/null
++++ b/Test/BetterGenshinImpact.AgentBridge.Tests/AgentJournalRowsTests.cs
+@@ -0,0 +1,57 @@
++using System.IO;
++using BetterGenshinImpact.Service.Agent;
++using Newtonsoft.Json.Linq;
++using Xunit;
++
++public class AgentJournalRowsTests
++{
++    private static JArray Rows(params string[] names) => new(names.Select((name, index) =>
++        new JObject { ["id"] = index + 1, ["name"] = name, ["location"] = "Mondstadt" }));
++
++    private static Dictionary<int, JObject> Evidence(int completeSlot) => Enumerable.Range(1, 4)
++        .ToDictionary(slot => slot, slot => new JObject { ["completed"] = slot == completeSlot,
++            ["evidence"] = new JObject { ["screenshot_sha256"] = $"frame-{slot}" } });
++
++    [Fact]
++    public void CompletedQuestMovingToTheBottomKeepsItsIdentityAndOwnScreenshot()
++    {
++        var previous = Rows("A", "B", "C", "D");
++        var observed = Rows("B", "C", "D", "A");
++        var observations = Evidence(4);
++        var bound = AgentJournalRows.Bind(previous, observed, observations);
++        Assert.Equal(new[] { "A", "B", "C", "D" }, bound.Rows.Select(r => r.Value<string>("name")));
++        Assert.Equal("1:A", bound.Evidence[1].Value<string>("quest_id"));
++        Assert.True(bound.Evidence[1].Value<bool>("completed"));
++        Assert.Equal("frame-4", bound.Evidence[1]["evidence"]!.Value<string>("screenshot_sha256"));
++        Assert.False(bound.Evidence[2].Value<bool>("completed"));
++        Assert.Equal("frame-1", bound.Evidence[2]["evidence"]!.Value<string>("screenshot_sha256"));
++        Assert.Null(observations[4]["quest_id"]);
++        Assert.Equal("B", observed[0].Value<string>("name"));
++    }
++
++    [Fact]
++    public void FirstScanAssignsStableIdentities()
++    {
++        var bound = AgentJournalRows.Bind(new JArray(), Rows("A", "B", "C", "D"), Evidence(4));
++        Assert.Equal("4:D", bound.Evidence[4].Value<string>("quest_id"));
++        Assert.True(bound.Evidence[4].Value<bool>("completed"));
++    }
++
++    [Theory]
++    [InlineData("A", "B", "C", "unknown")]
++    [InlineData("A", "B", "C", "C")]
++    public void ChangedOrAmbiguousIdentitiesCannotReassignCompletion(string a, string b, string c, string d)
++    {
++        var previous = Rows("A", "B", "C", "D");
++        Assert.Throws<InvalidDataException>(() => AgentJournalRows.Bind(previous, Rows(a, b, c, d), Evidence(4)));
++        Assert.Equal("D", previous[3].Value<string>("name"));
++    }
++
++    [Fact]
++    public void MissingVisualStatusCannotPublishAPartialSnapshot()
++    {
++        var observations = Evidence(4);
++        observations.Remove(2);
++        Assert.Throws<InvalidDataException>(() => AgentJournalRows.Bind(new JArray(), Rows("A", "B", "C", "D"), observations));
++    }
++}
+diff --git a/BetterGenshinImpact/Service/Agent/AgentRecoveryUi.cs b/BetterGenshinImpact/Service/Agent/AgentRecoveryUi.cs
+new file mode 100644
+--- /dev/null
++++ b/BetterGenshinImpact/Service/Agent/AgentRecoveryUi.cs
+@@ -0,0 +1,18 @@
++using System;
++using System.Text.RegularExpressions;
++
++namespace BetterGenshinImpact.Service.Agent;
++
++internal static class AgentRecoveryUi
++{
++    // The observed free respawn screen, not a food-selection revive dialog.
++    internal static bool IsColdDefeat(string text)
++    {
++        var compact = Regex.Replace(text, @"\s+", "");
++        return compact.Contains("复苏", StringComparison.Ordinal)
++            && compact.Contains("严寒", StringComparison.Ordinal)
++            && (compact.Contains("寒冷环境", StringComparison.Ordinal)
++                || (compact.Contains("积累至上限", StringComparison.Ordinal)
++                    && compact.Contains("削减角色生命值", StringComparison.Ordinal)));
++    }
++}
+diff --git a/Test/BetterGenshinImpact.AgentBridge.Tests/AgentRecoveryUiTests.cs b/Test/BetterGenshinImpact.AgentBridge.Tests/AgentRecoveryUiTests.cs
+new file mode 100644
+--- /dev/null
++++ b/Test/BetterGenshinImpact.AgentBridge.Tests/AgentRecoveryUiTests.cs
+@@ -0,0 +1,18 @@
++using BetterGenshinImpact.Service.Agent;
++using Xunit;
++
++namespace BetterGenshinImpact.AgentBridge.Tests;
++
++public sealed class AgentRecoveryUiTests
++{
++    [Theory]
++    [InlineData("严寒\n在寒冷环境下，要注意「严寒」的积累。\n复苏", true)]
++    [InlineData("严寒\n「严寒」积累至上限后，会快速削减角色生命值。\n复苏", true)]
++    [InlineData("严寒\n「严寒」积累至上限后，会快速削减角色生命值。", false)]
++    [InlineData("复苏\n选择料理\n严寒积累至上限", false)]
++    [InlineData("复苏\n选择料理\n提瓦特煎蛋", false)]
++    [InlineData("在寒冷环境下，要注意严寒的积累。", false)]
++    [InlineData("复苏\n角色已倒下", false)]
++    public void OnlyRecognizesObservedColdDefeat(string text, bool expected)
++        => Assert.Equal(expected, AgentRecoveryUi.IsColdDefeat(text));
++}
+diff --git a/BetterGenshinImpact/Service/Agent/AgentScriptInput.cs b/BetterGenshinImpact/Service/Agent/AgentScriptInput.cs
+new file mode 100644
+--- /dev/null
++++ b/BetterGenshinImpact/Service/Agent/AgentScriptInput.cs
+@@ -0,0 +1,46 @@
++using System;
++
++namespace BetterGenshinImpact.Service.Agent;
++
++/// <summary>Per-command interaction timing and dialogue-entry evidence.</summary>
++internal sealed class AgentScriptInput(
++    Action<string> press, Action<string> down, Action<string> up,
++    Action<int> wait, Func<bool> isDialogue, bool requireDialogue)
++{
++    private bool _interactionAttempted;
++    private bool _dialogueObserved;
++
++    internal void Press(string key)
++    {
++        ObserveDialogue();
++        if (!key.Equals("F", StringComparison.OrdinalIgnoreCase)
++            && !key.Equals("VK_F", StringComparison.OrdinalIgnoreCase))
++        {
++            press(key);
++            return;
++        }
++
++        _interactionAttempted = true;
++        // A down/up pair in one SendInput batch may be missed by a game frame.
++        // Always release even if cancellation arrives while the key is held.
++        down(key);
++        try { wait(100); }
++        finally { up(key); }
++        wait(400);
++        ObserveDialogue();
++    }
++
++    private void ObserveDialogue()
++    {
++        if (requireDialogue && !_dialogueObserved && isDialogue())
++            _dialogueObserved = true;
++    }
++
++    internal void VerifyDialogue()
++    {
++        ObserveDialogue();
++        if (requireDialogue && _interactionAttempted && !_dialogueObserved)
++            throw new InvalidOperationException(
++                "Talk commission attempted interaction but never entered a verified dialogue view.");
++    }
++}
+diff --git a/Test/BetterGenshinImpact.AgentBridge.Tests/AgentScriptInputTests.cs b/Test/BetterGenshinImpact.AgentBridge.Tests/AgentScriptInputTests.cs
+new file mode 100644
+--- /dev/null
++++ b/Test/BetterGenshinImpact.AgentBridge.Tests/AgentScriptInputTests.cs
+@@ -0,0 +1,47 @@
++using System;
++using System.Collections.Generic;
++using BetterGenshinImpact.Service.Agent;
++using Xunit;
++
++namespace BetterGenshinImpact.AgentBridge.Tests;
++
++public sealed class AgentScriptInputTests
++{
++    [Fact]
++    public void CancelDuringInteractionStillReleasesKey()
++    {
++        var events = new List<string>();
++        var input = new AgentScriptInput(k => events.Add("press"), k => events.Add("down"),
++            k => events.Add("up"), _ => throw new OperationCanceledException(), () => false, true);
++        Assert.Throws<OperationCanceledException>(() => input.Press("F"));
++        Assert.Equal(new[] { "down", "up" }, events);
++    }
++
++    [Fact]
++    public void WorldViewThroughoutDoesNotCountAsFinishedDialogue()
++    {
++        var input = new AgentScriptInput(_ => { }, _ => { }, _ => { }, _ => { }, () => false, true);
++        input.Press("VK_F");
++        Assert.Throws<InvalidOperationException>(input.VerifyDialogue);
++    }
++
++    [Fact]
++    public void ObservedDialogueMayReturnToWorldBeforeCompletion()
++    {
++        var inDialogue = false;
++        var input = new AgentScriptInput(_ => { }, _ => { }, _ => { },
++            ms => { if (ms == 400) inDialogue = true; }, () => inDialogue, true);
++        input.Press("F");
++        inDialogue = false;
++        input.VerifyDialogue();
++    }
++
++    [Fact]
++    public void NonTalkInteractionDoesNotRequireDialogue()
++    {
++        var input = new AgentScriptInput(_ => { }, _ => { }, _ => { }, _ => { },
++            () => throw new Exception("Unexpected capture"), false);
++        input.Press("F");
++        input.VerifyDialogue();
++    }
++}
+diff --git a/BetterGenshinImpact/Service/Agent/AgentVideoRecorder.cs b/BetterGenshinImpact/Service/Agent/AgentVideoRecorder.cs
+new file mode 100644
+--- /dev/null
++++ b/BetterGenshinImpact/Service/Agent/AgentVideoRecorder.cs
+@@ -0,0 +1,157 @@
++using System;
++using System.Diagnostics;
++using System.IO;
++using System.Security.Cryptography;
++using System.Threading;
++using System.Threading.Tasks;
++using Newtonsoft.Json.Linq;
++using OpenCvSharp;
++
++namespace BetterGenshinImpact.Service.Agent;
++
++/// <summary>Game frames only, no audio/input. Finalize independent one-minute clips.</summary>
++internal sealed class AgentVideoRecorder(string directory, Func<Mat> capture) : IAsyncDisposable
++{
++    private const int Fps = 10;
++    private readonly CancellationTokenSource _stop = new();
++    private readonly JArray _clips = new();
++    private Task? _task;
++    private readonly object _gate = new();
++    private readonly DateTimeOffset _started = DateTimeOffset.UtcNow;
++    private long _frames;
++    private string? _error;
++    internal event Action? Failed;
++
++    internal void Start()
++    {
++        lock (_gate)
++        {
++            if (_task != null) return;
++            Directory.CreateDirectory(directory);
++            _task = Task.Run(RecordAsync);
++        }
++    }
++
++    private void Status(string status)
++    {
++        var value = new JObject
++        {
++            ["schema_version"] = 1, ["status"] = status, ["source"] = "bettergi_game_window",
++            ["audio"] = false, ["fps"] = Fps, ["width"] = 1280, ["height"] = 720,
++            ["started_at"] = _started, ["updated_at"] = DateTimeOffset.UtcNow,
++            ["frames"] = _frames, ["clips"] = _clips.DeepClone(), ["error_type"] = _error
++        };
++        var path = Path.Combine(directory, "recording.json");
++        File.WriteAllText(path + ".tmp", value.ToString());
++        File.Move(path + ".tmp", path, true);
++    }
++
++    private async Task RecordAsync()
++    {
++        VideoWriter? writer = null;
++        string? path = null;
++        var framesInClip = 0;
++        var clipStarted = DateTimeOffset.UtcNow;
++        var clock = Stopwatch.StartNew();
++        var nextFrame = TimeSpan.Zero;
++        var status = "stopped";
++        try
++        {
++            using var timeline = new StreamWriter(Path.Combine(directory, "timeline.jsonl"), false);
++            while (!_stop.IsCancellationRequested && !File.Exists(Path.Combine(directory, "stop")))
++            {
++                if (clock.Elapsed > TimeSpan.FromHours(2))
++                    throw new TimeoutException("Recording lifetime exceeded.");
++                if (writer == null)
++                {
++                    path = Path.Combine(directory, $"game-{_clips.Count + 1:D4}.mp4");
++                    if (File.Exists(path)) throw new IOException("Recording file already exists.");
++                    writer = new VideoWriter(path, VideoCaptureAPIs.FFMPEG,
++                        VideoWriter.FourCC('m', 'p', '4', 'v'), Fps, new Size(1280, 720));
++                    if (!writer.IsOpened()) throw new IOException("Video encoder could not start.");
++                    framesInClip = 0;
++                    clipStarted = DateTimeOffset.UtcNow;
++                }
++                using var raw = capture();
++                if (raw.Empty()) throw new InvalidDataException("Empty game capture.");
++                using var bgr = new Mat();
++                if (raw.Channels() == 4) Cv2.CvtColor(raw, bgr, ColorConversionCodes.BGRA2BGR);
++                else if (raw.Channels() == 3) raw.CopyTo(bgr);
++                else throw new InvalidDataException("Unexpected game capture format.");
++                using var frame = new Mat();
++                Cv2.Resize(bgr, frame, new Size(1280, 720));
++                writer.Write(frame);
++                framesInClip++;
++                _frames++;
++                if (_frames % Fps == 1)
++                {
++                    timeline.WriteLine(new JObject { ["frame"] = _frames,
++                        ["at"] = DateTimeOffset.UtcNow, ["elapsed_ms"] = clock.ElapsedMilliseconds }.ToString(Newtonsoft.Json.Formatting.None));
++                    timeline.Flush();
++                    Status("recording");
++                }
++                if (framesInClip >= Fps * 60)
++                {
++                    writer.Dispose();
++                    writer = null;
++                    FinalizeClip(path!, framesInClip, clipStarted);
++                }
++                nextFrame += TimeSpan.FromSeconds(1.0 / Fps);
++                // Never burst-capture to conceal a stall. The timeline preserves timing gaps.
++                if (nextFrame < clock.Elapsed) nextFrame = clock.Elapsed;
++                var delay = nextFrame - clock.Elapsed;
++                await Task.Delay(delay > TimeSpan.Zero ? delay : TimeSpan.Zero, _stop.Token).ConfigureAwait(false);
++            }
++        }
++        catch (OperationCanceledException) when (_stop.IsCancellationRequested) { }
++        catch (Exception error)
++        {
++            _error = error.GetType().Name;
++            status = "failed";
++        }
++        finally
++        {
++            try
++            {
++                if (writer != null)
++                {
++                    writer.Dispose();
++                    if (framesInClip > 0) FinalizeClip(path!, framesInClip, clipStarted);
++                }
++            }
++            catch (Exception error) { _error = error.GetType().Name; status = "failed"; }
++            try { Status(status); } catch (IOException) { /* Never impede input release. */ }
++            if (status == "failed") Failed?.Invoke();
++        }
++    }
++
++    private void FinalizeClip(string path, int frames, DateTimeOffset started)
++    {
++        // Verify a finalized container, including the last frame, before claiming a clip.
++        using var reader = new VideoCapture(path, VideoCaptureAPIs.FFMPEG);
++        using var decoded = new Mat();
++        if (!reader.IsOpened() || !reader.Read(decoded) || decoded.Empty()
++            || !reader.Set(VideoCaptureProperties.PosFrames, frames - 1)
++            || !reader.Read(decoded) || decoded.Empty())
++            throw new InvalidDataException("Finalized video could not be decoded.");
++        using var stream = File.OpenRead(path);
++        _clips.Add(new JObject { ["path"] = Path.GetFileName(path), ["frames"] = frames,
++            ["started_at"] = started, ["ended_at"] = DateTimeOffset.UtcNow,
++            ["duration_seconds"] = frames / (double)Fps, ["bytes"] = stream.Length,
++            ["sha256"] = Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant(),
++            ["decode_verified"] = true });
++    }
++
++    public async ValueTask DisposeAsync()
++    {
++        _stop.Cancel();
++        Task? task;
++        lock (_gate) task = _task;
++        if (task != null)
++        {
++            try { await task.WaitAsync(TimeSpan.FromSeconds(10)).ConfigureAwait(false); }
++            catch (TimeoutException) { return; } // Keep the worker's CTS alive until process exit.
++        }
++        _stop.Dispose();
++    }
++}
+diff --git a/Test/BetterGenshinImpact.AgentBridge.Tests/AgentVideoRecorderTests.cs b/Test/BetterGenshinImpact.AgentBridge.Tests/AgentVideoRecorderTests.cs
+new file mode 100644
+--- /dev/null
++++ b/Test/BetterGenshinImpact.AgentBridge.Tests/AgentVideoRecorderTests.cs
+@@ -0,0 +1,53 @@
++using BetterGenshinImpact.Service.Agent;
++using Newtonsoft.Json.Linq;
++using OpenCvSharp;
++using Xunit;
++
++public class AgentVideoRecorderTests
++{
++    [Theory]
++    [InlineData(false)]
++    [InlineData(true)]
++    public async Task FinalizesDecodableVideoOnStopOrCaptureFailure(bool fail)
++    {
++        // Synthetic encoder/lifecycle test, never real gameplay acceptance evidence.
++        var directory = Path.Combine(Path.GetTempPath(), "startlux-video-" + Guid.NewGuid());
++        var captures = 0;
++        await using var video = new AgentVideoRecorder(directory, () =>
++        {
++            if (Interlocked.Increment(ref captures) > 3 && fail)
++                throw new InvalidOperationException("synthetic capture failure");
++            return new Mat(72, 128, MatType.CV_8UC3, new Scalar(20, 120, 200));
++        });
++        var failures = 0;
++        video.Failed += () => Interlocked.Increment(ref failures);
++        video.Start();
++        var deadline = DateTime.UtcNow.AddSeconds(15);
++        while (Volatile.Read(ref captures) < 4 && DateTime.UtcNow < deadline) await Task.Delay(50);
++        Assert.True(captures >= 4);
++        if (!fail) File.WriteAllText(Path.Combine(directory, "stop"), "");
++        JObject? metadata = null;
++        while (DateTime.UtcNow < deadline)
++        {
++            var path = Path.Combine(directory, "recording.json");
++            if (File.Exists(path))
++            {
++                metadata = JObject.Parse(File.ReadAllText(path));
++                if (metadata.Value<string>("status") is "stopped" or "failed") break;
++            }
++            await Task.Delay(50);
++        }
++        Assert.Equal(fail ? "failed" : "stopped", metadata?.Value<string>("status"));
++        var clip = Assert.Single((JArray)metadata!["clips"]!);
++        Assert.True(clip.Value<bool>("decode_verified"));
++        Assert.True(clip.Value<int>("frames") >= 3);
++        Assert.True(new FileInfo(Path.Combine(directory, clip.Value<string>("path")!)).Length > 100);
++        // The failure callback stops the native input lease, independently of the model request.
++        if (fail)
++        {
++            while (Volatile.Read(ref failures) == 0 && DateTime.UtcNow < deadline) await Task.Delay(10);
++            Assert.Equal(1, failures);
++        }
++        else Assert.Equal(0, failures);
++    }
++}
+diff --git a/BetterGenshinImpact/Service/Agent/AgentTimedRoutePolicy.cs b/BetterGenshinImpact/Service/Agent/AgentTimedRoutePolicy.cs
+new file mode 100644
+--- /dev/null
++++ b/BetterGenshinImpact/Service/Agent/AgentTimedRoutePolicy.cs
+@@ -0,0 +1,37 @@
++using System;
++using System.Text.RegularExpressions;
++
++namespace BetterGenshinImpact.Service.Agent;
++
++/// <summary>Bounded model-selected behavior for Full Speed Ahead only.</summary>
++internal static class AgentTimedRoutePolicy
++{
++    internal static int Validate(int threshold) => threshold == 0
++        ? threshold : throw new ArgumentOutOfRangeException(nameof(threshold));
++
++    internal static int? RemainingSeconds(string text)
++    {
++        var compact = Regex.Replace(text, @"\s+", "");
++        // A clock or ability cooldown alone cannot enable the route override.
++        if (!(compact.Contains("击败魔物", StringComparison.Ordinal)
++                || compact.Contains("消灭魔物", StringComparison.Ordinal))
++            || !compact.Contains("时间", StringComparison.Ordinal)
++            || !compact.Contains("中断挑战", StringComparison.Ordinal))
++            return null;
++        var labelled = Regex.Match(compact, @"剩余时间[:：](\d{1,3})秒");
++        int? seconds = labelled.Success ? int.Parse(labelled.Groups[1].Value) : null;
++        var clock = Regex.Match(text, @"(?<!\d)([0-2]):([0-5]\d)(?!\d)");
++        // Also accept the observed 00:29 form, retaining exact timer syntax.
++        if (!clock.Success) clock = Regex.Match(text, @"(?<!\d)(0[0-2]):([0-5]\d)(?!\d)");
++        if (clock.Success)
++        {
++            var clockSeconds = int.Parse(clock.Groups[1].Value) * 60 + int.Parse(clock.Groups[2].Value);
++            if (seconds.HasValue && Math.Abs(seconds.Value - clockSeconds) > 1) return null;
++            seconds ??= clockSeconds;
++        }
++        return seconds is > 0 and <= 180 ? seconds : null;
++    }
++
++    internal static bool SkipFight(int threshold, int? seconds)
++        => Validate(threshold) > 0 && seconds is > 0 && seconds <= threshold;
++}
+diff --git a/Test/BetterGenshinImpact.AgentBridge.Tests/AgentTimedRoutePolicyTests.cs b/Test/BetterGenshinImpact.AgentBridge.Tests/AgentTimedRoutePolicyTests.cs
+new file mode 100644
+--- /dev/null
++++ b/Test/BetterGenshinImpact.AgentBridge.Tests/AgentTimedRoutePolicyTests.cs
+@@ -0,0 +1,47 @@
++using System;
++using BetterGenshinImpact.Service.Agent;
++using Xunit;
++
++namespace BetterGenshinImpact.AgentBridge.Tests;
++
++public sealed class AgentTimedRoutePolicyTests
++{
++    private const string Active = "击败魔物获取更多时间\n中断挑战\n";
++
++    [Theory]
++    [InlineData("00:29\n剩余时间：29秒", 29)]
++    [InlineData("01:02", 62)]
++    [InlineData("剩余时间:45秒", 45)]
++    public void ReadsObservedChallengeTimer(string text, int seconds)
++        => Assert.Equal(seconds, AgentTimedRoutePolicy.RemainingSeconds(Active + text));
++
++    [Theory]
++    [InlineData("00:58\n剩余时间:58秒\n消灭魔物会获得额外时间\nP 中断挑战", 58)]
++    [InlineData("00:39\n剩余时间：39秒\n消灭魔物会获得额外时间\n中断挑战", 39)]
++    public void ReadsActualSnowMountainVideoWording(string text, int seconds)
++        => Assert.Equal(seconds, AgentTimedRoutePolicy.RemainingSeconds(text));
++
++    [Fact]
++    public void MonsterTimeBonusTextWithoutActiveChallengeCannotEnableSkipping()
++        => Assert.Null(AgentTimedRoutePolicy.RemainingSeconds("00:58\n消灭魔物会获得额外时间"));
++
++    [Theory]
++    [InlineData("00:29\n击败魔物获取更多时间")]
++    [InlineData("00:29\n中断挑战")]
++    [InlineData("00:29\n剩余时间：29秒")]
++    [InlineData("击败魔物获取更多时间\n中断挑战\n剩余时间：29秒\n00:49")]
++    [InlineData("击败魔物获取更多时间\n中断挑战\n00:00")]
++    [InlineData("击败魔物获取更多时间\n中断挑战\n03:99")]
++    public void UnrelatedAmbiguousOrExpiredTimersCannotEnableSkipping(string text)
++        => Assert.Null(AgentTimedRoutePolicy.RemainingSeconds(text));
++
++    [Fact]
++    public void PreservesParentAndUnknownTimerBehavior()
++    {
++        Assert.False(AgentTimedRoutePolicy.SkipFight(0, 10));
++        Assert.False(AgentTimedRoutePolicy.SkipFight(0, null));
++        foreach (var retired in new[] { 30, 45, 60 })
++            Assert.Throws<ArgumentOutOfRangeException>(() => AgentTimedRoutePolicy.Validate(retired));
++        Assert.Throws<ArgumentOutOfRangeException>(() => AgentTimedRoutePolicy.Validate(120));
++    }
++}
+diff --git a/BetterGenshinImpact/Core/Config/PathingPartyConfig.cs b/BetterGenshinImpact/Core/Config/PathingPartyConfig.cs
+--- a/BetterGenshinImpact/Core/Config/PathingPartyConfig.cs
++++ b/BetterGenshinImpact/Core/Config/PathingPartyConfig.cs
+@@ -40,6 +40,17 @@
+ 
+     [JsonIgnore]
+     public bool SkipPartySwitch { get; set; }
++
++    // Runtime-only override for timed tasks; never changes persisted user settings.
++    [JsonIgnore]
++    public bool SuppressOptionalBattleLoot { get; set; }
++
++    // Per-command pinned daily route, never a persisted user preference.
++    [JsonIgnore]
++    public bool VerifiedCommissionCombat { get; set; }
++
++    [JsonIgnore]
++    public int TimedRouteSkipCombatBelowSeconds { get; set; }
+     
+     // 切换队伍前是否前往须弥七天神像
+     [ObservableProperty]
+diff --git a/BetterGenshinImpact/GameTask/AutoPathing/PathExecutor.cs b/BetterGenshinImpact/GameTask/AutoPathing/PathExecutor.cs
+--- a/BetterGenshinImpact/GameTask/AutoPathing/PathExecutor.cs
++++ b/BetterGenshinImpact/GameTask/AutoPathing/PathExecutor.cs
+@@ -476,10 +476,17 @@
+         // 必须放在这里，因为要通过队伍识别来得到最终结果
+         var pathingConditionConfig = TaskContext.Instance().Config.PathingConditionConfig;
+         var skipPartySwitch = PartyConfig.SkipPartySwitch;
++        var suppressOptionalBattleLoot = PartyConfig.SuppressOptionalBattleLoot;
++        var verifiedCommissionCombat = PartyConfig.VerifiedCommissionCombat;
++        var timedRouteSkipCombatBelowSeconds = PartyConfig.TimedRouteSkipCombatBelowSeconds;
+         if (PartyConfig is { Enabled: false })
+         {
+             PartyConfig = pathingConditionConfig.BuildPartyConfigByCondition(_combatScenes);
+             PartyConfig.SkipPartySwitch = skipPartySwitch;
++            // 条件配置重建后仍保留本次限时路线的运行时限制。
++            PartyConfig.SuppressOptionalBattleLoot = suppressOptionalBattleLoot;
++            PartyConfig.VerifiedCommissionCombat = verifiedCommissionCombat;
++            PartyConfig.TimedRouteSkipCombatBelowSeconds = timedRouteSkipCombatBelowSeconds;
+         }
+ 
+         // 校验角色是否存在
+@@ -887,6 +894,11 @@
+                             await _trapEscaper.RotateAndMove();
+                             await _trapEscaper.MoveTo(waypoint);
+                             InputHub.Foreground.SimulateAction(GIActions.MoveForward, KeyType.KeyDown);
++                            // Recovery changes both position and orientation. Give normal
++                            // traversal a fresh sampling window; old samples otherwise
++                            // trigger another recovery immediately and exhaust the budget.
++                            prevPositions.Clear();
++                            lastPositionRecord = DateTime.UtcNow;
+                             Logger.LogInformation("卡死脱离结束");
+                             continue;
+                         }
+diff --git a/BetterGenshinImpact/GameTask/AutoFight/AutoFightParam.cs b/BetterGenshinImpact/GameTask/AutoFight/AutoFightParam.cs
+--- a/BetterGenshinImpact/GameTask/AutoFight/AutoFightParam.cs
++++ b/BetterGenshinImpact/GameTask/AutoFight/AutoFightParam.cs
+@@ -41,6 +41,7 @@
+     public string CombatStrategyPath { get; set; }
+ 
+     public bool FightFinishDetectEnabled { get; set; } = false;
++    public bool RequireFightCompletion { get; set; } = false;
+     public bool PickDropsAfterFightEnabled { get; set; } = true;
+     public int PickDropsAfterFightSeconds { get; set; } = 15;
+     public int BattleThresholdForLoot { get; set; } = -1;
+diff --git a/BetterGenshinImpact/GameTask/AutoFight/AutoFightTask.cs b/BetterGenshinImpact/GameTask/AutoFight/AutoFightTask.cs
+--- a/BetterGenshinImpact/GameTask/AutoFight/AutoFightTask.cs
++++ b/BetterGenshinImpact/GameTask/AutoFight/AutoFightTask.cs
+@@ -529,6 +529,8 @@
+ 
+         try
+         {
++            if (_taskParam.RequireFightCompletion && timeOutFlag)
++                throw new TimeoutException("必需战斗未确认结束，不能继续委托路线");
+             // 基于经验值检测结果的拾取判断
+             if (_taskParam.KazuhaPickupEnabled && _taskParam.ExpBasedPickupEnabled && expDetector != null)
+             {
+diff --git a/BetterGenshinImpact/GameTask/AutoPathing/Handler/AutoFightHandler.cs b/BetterGenshinImpact/GameTask/AutoPathing/Handler/AutoFightHandler.cs
+--- a/BetterGenshinImpact/GameTask/AutoPathing/Handler/AutoFightHandler.cs
++++ b/BetterGenshinImpact/GameTask/AutoPathing/Handler/AutoFightHandler.cs
+@@ -8,6 +8,8 @@
+ using System.Threading.Tasks;
+ using BetterGenshinImpact.GameTask.AutoPathing.Model;
+ using Microsoft.Extensions.Logging;
++using BetterGenshinImpact.Service.Agent;
++using BetterGenshinImpact.Core.Recognition.OCR;
+ 
+ namespace BetterGenshinImpact.GameTask.AutoPathing.Handler;
+ 
+@@ -26,6 +28,16 @@
+ 
+     private async Task StartFight(CancellationToken ct, object? config = null , WaypointForTrack? waypointForTrack = null)
+     {
++        ct.ThrowIfCancellationRequested();
++        if (config is PathingPartyConfig { SuppressOptionalBattleLoot: true } timed)
++        {
++            AgentTimedRoutePolicy.Validate(timed.TimedRouteSkipCombatBelowSeconds);
++            using var capture = TaskControl.CaptureToRectArea();
++            var seconds = AgentTimedRoutePolicy.RemainingSeconds(OcrFactory.Paddle.Ocr(capture.SrcMat));
++            ct.ThrowIfCancellationRequested();
++            _logger.LogInformation("限时计时器检查：剩余 {Seconds} 秒；必须清除此处魔物，禁止跳过战斗",
++                seconds);
++        }
+         TaskControl.Logger.LogInformation("执行 {Text}", "自动战斗");
+         // 爷们要战斗
+         AutoFightParam taskParams = null;
+@@ -38,6 +50,23 @@
+         else
+         {
+             taskParams = new AutoFightParam(GetFightStrategy(), TaskContext.Instance().Config.AutoFightConfig);
++        }
++
++        if (config is PathingPartyConfig { VerifiedCommissionCombat: true } or
++            PathingPartyConfig { SuppressOptionalBattleLoot: true })
++        {
++            taskParams.FightFinishDetectEnabled = true;
++            taskParams.RequireFightCompletion = true;
++            taskParams.PickDropsAfterFightEnabled = false;
++            taskParams.KazuhaPickupEnabled = false;
++            taskParams.QinDoublePickUp = false;
++            // The joined continuous targeting loop reacquires off-screen enemies.
++            // Keep the legacy fire-and-forget movement seeker disabled here.
++            taskParams.EnableCombatTargeting = true;
++            taskParams.TargetingDetectionInterval = 100;
++            taskParams.FinishDetectConfig.RotateFindEnemyEnabled = false;
++            taskParams.FinishDetectConfig.SkipFightEndCheckWhenEnemyVisible = true;
++            _logger.LogInformation("每日委托启用持续索敌、核验战斗结束并跳过可选拾取");
+         }
+ 
+         //根据怪物标签，调整拾取配置

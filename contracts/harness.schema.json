@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Proposed declarative HarnessBundle v0.1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "artifact_status", "game_spec_id", "action_catalog_id", "control_mode", "decision_instructions", "state_presentation", "feature_ids", "memory", "strategy_notes", "knowledge_sources"],
+  "properties": {
+    "schema_version": {"const": "0.1"},
+    "artifact_status": {"enum": ["design_example", "candidate", "validated"]},
+    "game_spec_id": {"type": "string", "minLength": 1},
+    "action_catalog_id": {"type": "string", "minLength": 1},
+    "control_mode": {"const": "strict_model_control"},
+    "decision_instructions": {"type": "string", "minLength": 1, "maxLength": 8000},
+    "state_presentation": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "feature_ids": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "memory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["history_window", "phase_labels", "phase_selector"],
+      "properties": {
+        "history_window": {"type": "integer", "minimum": 0, "maximum": 64},
+        "phase_labels": {"type": "array", "maxItems": 12, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "phase_selector": {"enum": ["disabled", "decision_model"]}
+      }
+    },
+    "strategy_notes": {"type": "array", "maxItems": 30, "items": {"type": "string", "maxLength": 2000}},
+    "knowledge_sources": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["reference", "claim_type", "applicability"],
+        "properties": {
+          "reference": {"type": "string", "minLength": 1},
+          "claim_type": {"enum": ["verified_rule", "external_strategy", "coach_hypothesis", "user_requirement"]},
+          "applicability": {"type": "string", "minLength": 1}
+        }
+      }
+    }
+  }
+}

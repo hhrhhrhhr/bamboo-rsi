@@ -1,0 +1,19 @@
+{
+  "schema_version": 2,
+  "id": "genshin-daily-fixture",
+  "version": "0.1.0",
+  "game_id": "genshin",
+  "environment": "fixture",
+  "release_status": "development",
+  "decision_model": "fixture-startlux-pinned",
+  "regions": [
+    "mondstadt"
+  ],
+  "files": {
+    "actions.json": "bd63ecb369d69c0ecbccc61f31a4542e4f27454fff90ea0aeb68fa61c66ca06e",
+    "instructions.txt": "48da33675cf59b67d8b5b84d3ca40ae8a077045df74703d768ac09881603d84e"
+  },
+  "attributions": [
+    "Synthetic protocol fixture authored for game-harness-lab; no live routes or game capability claims"
+  ]
+}

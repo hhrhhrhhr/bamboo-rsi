@@ -1,0 +1,28 @@
+StartLux Genshin desktop preview 0.3.0
+
+BetterGI and AutoCommission: GPL-3.0. Their original branding, source and licenses
+are retained under sources/ and task-source/. The exact BetterGI base archive and
+integration patch are supplied; apply the patch with git apply before building.
+Original authors: https://github.com/babalae/better-genshin-impact and
+https://github.com/LX666-666/AutoCommission (星野 and contributors).
+
+The added desktop UI, bundled Genshin agent and native integration are distributed
+under GPL-3.0-or-later. See sources/BetterGI-LICENSE for the complete GPL v3 text.
+No game client is included.
+
+Vosk API and vosk-model-small-cn-0.22: Apache-2.0
+https://github.com/alphacep/vosk-api
+https://alphacephei.com/vosk/models
+https://www.apache.org/licenses/LICENSE-2.0
+
+NAudio 2.2.1: MIT https://github.com/naudio/NAudio/blob/master/license.txt
+CommunityToolkit.Mvvm 8.2.2: MIT https://github.com/CommunityToolkit/dotnet/blob/main/License.md
+Newtonsoft.Json 13.0.3: MIT https://github.com/JamesNK/Newtonsoft.Json/blob/master/LICENSE.md
+.NET runtime and System.Security.Cryptography.ProtectedData 8.0.0: MIT
+https://github.com/dotnet/runtime/blob/main/LICENSE.TXT
+Python: PSF-2.0 https://docs.python.org/3/license.html
+PyInstaller: GPL-2.0-or-later with bootloader exception
+https://pyinstaller.org/en/stable/license.html
+
+The full licenses retained by installed Python distributions are in licenses/.
+The frozen agent contains no cloud Harness² optimizer or teacher model credentials.

@@ -1,0 +1,8 @@
+{
+  "tasks": [
+    {"id": "ledger-a", "split": "evolve", "amounts": ["100.25", "-20.10", "5.00"]},
+    {"id": "ledger-b", "split": "evolve", "amounts": ["35.50", "-10.25", "-5.00"]},
+    {"id": "ledger-c", "split": "heldout", "amounts": ["7.20", "-8.40", "2.10"]},
+    {"id": "ledger-d", "split": "heldout", "amounts": ["-12.34", "0.04"]}
+  ]
+}

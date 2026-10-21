@@ -1,0 +1,1 @@
+Synthetic plumbing fixture only. Choose a skill supported by the current visible scene and phase. Abstain when the visible context does not justify any offered action. A returned skill does not prove completion or a reward.

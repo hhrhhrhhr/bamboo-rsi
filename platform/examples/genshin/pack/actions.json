@@ -1,0 +1,59 @@
+[
+  {
+    "id": "inspect",
+    "label": "Inspect the daily commission journal",
+    "skill": "observe.daily",
+    "skill_version": "1",
+    "arguments": {},
+    "preconditions": {
+      "region": "mondstadt",
+      "scene": "world",
+      "phase": "inspect"
+    },
+    "timeout_ms": 30000,
+    "ttl_ms": 3000
+  },
+  {
+    "id": "fight",
+    "label": "Fight the current commission enemies",
+    "skill": "combat.run",
+    "skill_version": "1",
+    "arguments": {},
+    "preconditions": {
+      "region": "mondstadt",
+      "scene": "world",
+      "phase": "combat"
+    },
+    "timeout_ms": 30000,
+    "ttl_ms": 3000
+  },
+  {
+    "id": "claim",
+    "label": "Claim the verified daily reward",
+    "skill": "daily.claim",
+    "skill_version": "1",
+    "arguments": {},
+    "preconditions": {
+      "region": "mondstadt",
+      "scene": "world",
+      "phase": "reward",
+      "commissions_verified": true
+    },
+    "timeout_ms": 30000,
+    "ttl_ms": 3000
+  },
+  {
+    "id": "inspect_uncertain",
+    "label": "Inspect the journal when the current target is uncertain",
+    "skill": "observe.daily",
+    "skill_version": "1",
+    "arguments": {},
+    "preconditions": {
+      "region": "mondstadt",
+      "scene": "world",
+      "phase": "uncertain"
+    },
+    "timeout_ms": 30000,
+    "ttl_ms": 3000
+  }
+]
