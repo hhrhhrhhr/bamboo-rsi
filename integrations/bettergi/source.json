@@ -3,7 +3,7 @@
   "base_commit": "b3f90e70494320639eeccc8c559612d02d2d9ef0",
   "local_development_commit": null,
   "patch_file": "startlux-agent-bridge.patch",
-  "patch_sha256": "d9d153891c2048f194055431158fed1df677b09e7cd9e40ce1ff04d6efd7c3e7",
+  "patch_sha256": "a84965c817b4949e23d11210dc4c797d4a08e547f4ad61b887dc9f8ec2308d58",
   "license": "GPL-3.0",
   "status": "development",
   "protocol_version": 1,
@@ -22,6 +22,9 @@
     "record game-window-only video in independently decoded minute clips with run-linked hashes",
     "hold script interaction keys across game frames and verify dialogue entry for talk commissions",
     "enable joined continuous targeting in pinned daily routes and reject every unverified combat timeout",
-    "replace real account UID in OCR regression fixtures with synthetic digits for public distribution"
+    "replace real account UID in OCR regression fixtures with synthetic digits for public distribution",
+    "hold commission flight inputs across game frames with fresh capture and a glider-toggle cooldown",
+    "remove blind freefall toggles before commission landing and require stable post-action observations",
+    "abort commission routes after recovery instead of resuming old coordinates from a different region"
   ]
 }

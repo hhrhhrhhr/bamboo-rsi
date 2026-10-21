@@ -11,7 +11,7 @@ async function check(scores, expected) {
   const crop = { SrcMat: { id: 'crop' }, dispose() { disposed.push('crop'); },
     find(ro) { return { isEmpty: () => scores[ro.kind] < ro.threshold,
       dispose() { disposed.push('match-' + ro.kind); } }; } };
-  const context = { CommissionBasic: {}, Constants: { COMMISSION_DETAIL_BUTTONS: [
+  const context = { Execute: {}, CommissionBasic: {}, Constants: { COMMISSION_DETAIL_BUTTONS: [
     {checkX: 1450, y: 320, checkWidth: 150}], COMPLETED_IMAGE_PATH: 'completed',
     UNCOMPLETED_IMAGE_PATH: 'pending' },
     captureGameRegion: () => ({ SrcMat: frame, deriveCrop: () => crop,
@@ -54,6 +54,33 @@ async function checkExecution(type, healFails = false) {
   }
 }
 
+async function checkTalkSteps(fail) {
+  const calls = [];
+  const context = {CommissionBasic:{}, file:{readTextSync:()=>''},
+    settings:{operation:'execute',questJson:JSON.stringify({type:'talk',name:'fixture',location:'fixture'})},
+    UI:{UIUtils:{isInMainUI:()=>true}}, StepProcessorLoader:{loadStepProcessors(){}},
+    genshin:{async returnMainUi(){calls.push('world');}}, setGameMetrics(){},sleep:async()=>{},
+    Execute:{
+      async findCommissionTarget(){calls.push('track');},
+      processStepConfiguration(step,priorityOptions,npcWhiteList){return {priorityOptions,npcWhiteList};},
+      async processStep(step,ctx){
+        assert.equal(ctx.commissionName,'fixture');
+        calls.push(step);
+        if(fail && step==='route.json')throw new Error('route recovery requires restart');
+      },
+      async executeTalkCommission(name,location){
+        return context.Execute.executeUnifiedTalkProcess(['route.json','F'],name,location);
+      }
+    }};
+  if(fail) {
+    await assert.rejects(vm.runInNewContext(source,context),/route recovery requires restart/);
+    assert.deepEqual(calls,['world','track','route.json','world']);
+  } else {
+    await vm.runInNewContext(source,context);
+    assert.deepEqual(calls,['world','track','route.json','F','world']);
+  }
+}
+
 (async () => {
   await check({completed:0.61,pending:0.805}, 'uncompleted');
   await check({completed:0.95,pending:0.4}, 'completed');
@@ -62,5 +89,7 @@ async function checkExecution(type, healFails = false) {
   await checkExecution('fight');
   await checkExecution('talk');
   await checkExecution('fight',true);
-  process.stdout.write('7 adapter boundary checks passed\n');
+  await checkTalkSteps(true);
+  await checkTalkSteps(false);
+  process.stdout.write('9 adapter boundary checks passed\n');
 })().catch(error => { console.error(error); process.exitCode = 1; });

@@ -26,7 +26,18 @@ def write_state(status, **fields):
     temporary = STATE.with_suffix(".tmp")
     temporary.write_text(json.dumps({"status": status, "time": time.strftime("%Y-%m-%d %H:%M:%S"),
                                     **fields}, ensure_ascii=True, indent=2), encoding="utf-8")
-    temporary.replace(STATE)
+    # Windows readers can briefly deny FILE_SHARE_DELETE. This file is a UI
+    # status cache, so a sharing violation must never abort an owned game run.
+    for attempt in range(8):
+        try:
+            temporary.replace(STATE)
+            return True
+        except PermissionError:
+            time.sleep(0.05)
+    with (RUNTIME / "state-write-warnings.jsonl").open("a", encoding="utf-8") as output:
+        output.write(json.dumps({"status": status, "error_type": "PermissionError",
+                                 "time": time.time(), "retries": 8}) + "\n")
+    return False
 
 
 def read_credential(path):
@@ -103,6 +114,17 @@ def finalize_recording(run):
             atomic_json(run / "video-finalize-error.json", {"error_type": type(error).__name__})
 
 
+def prepare_execution_assets(root, home, destination):
+    """Resolve the fixed policy first; the worker then binds its sealed adapter."""
+    shutil.copytree(root / "integrations/auto_commission/upstream", destination / "autocommission")
+    adapter = root / "integrations/auto_commission/agent-main.js"
+    if (home / "rsi/program-baseline.json").exists():
+        from startlux.scenarios.genshin.taskpack import TaskPack
+        base = TaskPack.load(home / "rsi/base-pack")
+        adapter = base.root / "agent-main.js"
+    shutil.copyfile(adapter, destination / "agent-main.js")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-mode", choices=["development", "autonomous"], default="development")
@@ -163,11 +185,10 @@ def main():
             write_state("bettergi_already_running")
             return 6
         key = read_credential(home / "credential.dpapi")
-        # Freeze the current workspace adapter/routes, not an older installed JS.
+        # Keep the historical policy identity separate from the assigned program.
         assets = tempfile.TemporaryDirectory(prefix="task-source-", dir=RUNTIME)
         assets_path = Path(assets.name)
-        shutil.copytree(ROOT / "integrations/auto_commission/upstream", assets_path / "autocommission")
-        shutil.copyfile(ROOT / "integrations/auto_commission/agent-main.js", assets_path / "agent-main.js")
+        prepare_execution_assets(ROOT, home, assets_path)
         with (RUNTIME / "live-events.jsonl").open("a", encoding="utf-8", buffering=1) as log, \
                 (RUNTIME / "live-worker-stderr.log").open("w", encoding="utf-8") as stderr:
             worker = subprocess.Popen([*entry, "run",
@@ -179,13 +200,16 @@ def main():
             write_state("worker_started", pipe=pipe, worker_pid=worker.pid, controller_pid=os.getpid())
 
             def cancel_worker():
+                acknowledged = False
                 try:
                     WindowsPipeSession(pipe).stop()
-                    record_acknowledged_stop(home, pipe)
+                    acknowledged = True
                 except (OSError, RuntimeError, ValueError):
                     pass
                 finally:
                     terminate_worker(worker)
+                    if acknowledged:
+                        record_acknowledged_stop(home, pipe)
 
             watcher = threading.Thread(target=watch_stop_command,
                 args=(RUNTIME / "live-command.json", started_ns, finished, stop_requested, cancel_worker), daemon=True)
@@ -230,6 +254,7 @@ def main():
         write_state("launcher_error", pipe=pipe, **error_fields(error))
         return 1
     finally:
+        acknowledged = False
         finished.set()
         if watcher is not None:
             watcher.join(timeout=1)
@@ -237,7 +262,7 @@ def main():
             may_terminate = host_never_armed
             try:
                 WindowsPipeSession(pipe).stop()
-                record_acknowledged_stop(home, pipe)
+                acknowledged = True
                 may_terminate = True
             except (OSError, TimeoutError, RuntimeError, ValueError):
                 # A missed stop acknowledgement leaves the native watchdog alive.
@@ -253,6 +278,9 @@ def main():
                     pass  # Diagnostic collection must not prevent releasing owned inputs.
         if worker is not None and worker.poll() is None:
             terminate_worker(worker)
+        if acknowledged:
+            # Bind the stop receipt only after the worker has finalized attempt.json.
+            record_acknowledged_stop(home, pipe)
         if assets is not None:
             assets.cleanup()
 

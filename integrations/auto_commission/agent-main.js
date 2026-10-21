@@ -4,6 +4,25 @@ for (const module of ["constants.js", "lib/utils.js", "lib/ui.js", "lib/core.js"
   "lib/commission-recognition.js", "lib/commission-data.js", "lib/step-processor-loader.js"])
   eval(file.readTextSync(module));
 
+// Upstream catches failed steps and continues with dialogue/attacks at the wrong
+// location. Keep the same step processors but make prerequisites fail closed.
+Execute.executeUnifiedTalkProcess = async function (steps, name, location) {
+  if (!steps || steps.length === 0) return false;
+  let priorityOptions = [], npcWhiteList = [];
+  await Execute.findCommissionTarget(name);
+  for (let i = 0; i < steps.length; i++) {
+    const config = Execute.processStepConfiguration(steps[i], priorityOptions, npcWhiteList);
+    priorityOptions = config.priorityOptions;
+    npcWhiteList = config.npcWhiteList;
+    await Execute.processStep(steps[i], {
+      commissionName: name, location, processSteps: steps, currentIndex: i,
+      isInMainUI: UI.UIUtils.isInMainUI, priorityOptions, npcWhiteList
+    });
+    await sleep(2000);
+  }
+  return true;
+};
+
 // Require an unambiguous template match; archive the exact journal frame before
 // navigation changes it. A failed recognition is never treated as incomplete.
 CommissionBasic.detectCommissionStatusByImage = async function (index) {

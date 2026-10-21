@@ -22,6 +22,32 @@ controller = importlib.util.module_from_spec(controller_spec)
 controller_spec.loader.exec_module(controller)
 
 
+def test_program_adapter_migration_keeps_policy_identity_and_rejects_changed_routes(tmp_path):
+    import shutil
+    from test_genshin_rsi import setup_store, CONFIG, NOW
+    from startlux.scenarios.genshin.desktop import prepare_daily_pack, load_run_policy
+    from startlux.scenarios.genshin.episode import configured_scope
+    home, root = tmp_path / "home", tmp_path / "checkout"
+    home.mkdir()
+    store, base, frozen = setup_store(home)
+    source = root / "integrations/auto_commission"
+    shutil.copytree(home / "source/autocommission", source / "upstream")
+    (source / "agent-main.js").write_text("// new program adapter")
+    (store.root / "program-baseline.json").write_text("{}")
+    destination = tmp_path / "assets"
+    launcher.prepare_execution_assets(root, home, destination)
+    assert (destination / "agent-main.js").read_bytes() == (frozen.root / "agent-main.js").read_bytes()
+    pack = prepare_daily_pack(destination, tmp_path / "pack", CONFIG["model_id"])
+    _, event = load_run_policy(pack, home, scope=configured_scope(CONFIG, now=NOW), run_mode="development")
+    assert event["rsi"]["bundle_hash"] == store.active(base).identity
+    # Only the program adapter is deferred to binding; changed task files still fail.
+    (source / "upstream/name.json").write_text('{"changed":true}')
+    launcher.prepare_execution_assets(root, home, tmp_path / "changed-assets")
+    changed = prepare_daily_pack(tmp_path / "changed-assets", tmp_path / "changed-pack", CONFIG["model_id"])
+    with pytest.raises(ValueError, match="fixed resources"):
+        load_run_policy(changed, home, scope=configured_scope(CONFIG, now=NOW), run_mode="development")
+
+
 def test_launcher_finalizes_video_when_worker_was_terminated(tmp_path, monkeypatch):
     (tmp_path / "video").mkdir()
     calls = []
@@ -33,6 +59,25 @@ def test_launcher_finalizes_video_when_worker_was_terminated(tmp_path, monkeypat
         "complete": True, "finalized_by": "launcher_cleanup"}
     launcher.finalize_recording(tmp_path)
     assert len(calls) == 1  # Preserve the first finalized report.
+
+
+@pytest.mark.parametrize("failures", [3, 20])
+def test_status_reader_sharing_violation_does_not_abort_run(tmp_path, monkeypatch, failures):
+    monkeypatch.setattr(launcher, "RUNTIME", tmp_path)
+    monkeypatch.setattr(launcher, "STATE", tmp_path / "state.json")
+    launcher.STATE.write_text('{"status":"previous"}')
+    monkeypatch.setattr(launcher.time, "sleep", lambda _: None)
+    original, attempts = Path.replace, []
+    def replace(path, destination):
+        attempts.append(path)
+        if len(attempts) <= failures:
+            raise PermissionError("sharing violation")
+        return original(path, destination)
+    monkeypatch.setattr(Path, "replace", replace)
+    assert launcher.write_state("running") is (failures < 8)
+    assert json.loads(launcher.STATE.read_text())["status"] == ("running" if failures < 8 else "previous")
+    if failures >= 8:
+        assert json.loads((tmp_path / "state-write-warnings.jsonl").read_text())["retries"] == 8
 
 
 def test_video_cleanup_failure_does_not_block_launcher_input_cleanup(tmp_path, monkeypatch):

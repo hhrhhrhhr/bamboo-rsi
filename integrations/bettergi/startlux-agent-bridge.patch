@@ -505,9 +505,10 @@ index e27f6e7f..e512631d 100644
  		<Version>0.66.2-alpha.2</Version>
 diff --git a/BetterGenshinImpact/Service/Agent/AgentDailyJournal.cs b/BetterGenshinImpact/Service/Agent/AgentDailyJournal.cs
 new file mode 100644
+index 0000000..f6f4065
 --- /dev/null
 +++ b/BetterGenshinImpact/Service/Agent/AgentDailyJournal.cs
-@@ -0,0 +1,317 @@
+@@ -0,0 +1,318 @@
 +using System;
 +using System.Collections.Generic;
 +using System.IO;
@@ -806,6 +807,7 @@ new file mode 100644
 +        try
 +        {
 +            _token.ThrowIfCancellationRequested();
++            if (Failed) throw new InvalidOperationException("A previous commission route failed; rescan before retrying.");
 +            var name = "autocommission/" + path.Replace('\\', '/');
 +            if (!_resources.TryGetValue(name, out var bytes))
 +                throw new InvalidDataException("Route is outside the pinned source pack.");
@@ -1504,9 +1506,10 @@ new file mode 100644
 +}
 diff --git a/Test/BetterGenshinImpact.AgentBridge.Tests/BetterGenshinImpact.AgentBridge.Tests.csproj b/Test/BetterGenshinImpact.AgentBridge.Tests/BetterGenshinImpact.AgentBridge.Tests.csproj
 new file mode 100644
+index 0000000..6d4bcd8
 --- /dev/null
 +++ b/Test/BetterGenshinImpact.AgentBridge.Tests/BetterGenshinImpact.AgentBridge.Tests.csproj
-@@ -0,0 +1,22 @@
+@@ -0,0 +1,23 @@
 +<Project Sdk="Microsoft.NET.Sdk">
 +  <PropertyGroup>
 +    <TargetFramework>net8.0</TargetFramework>
@@ -1516,6 +1519,7 @@ new file mode 100644
 +    <IsPackable>false</IsPackable>
 +  </PropertyGroup>
 +  <ItemGroup>
++    <Compile Include="../../BetterGenshinImpact/Service/Agent/AgentFlightInput.cs" Link="AgentFlightInput.cs" />
 +    <Compile Include="../../BetterGenshinImpact/Service/Agent/AgentUidRecognition.cs" Link="AgentUidRecognition.cs" />
 +    <Compile Include="../../BetterGenshinImpact/Service/Agent/AgentJournalRows.cs" Link="AgentJournalRows.cs" />
 +    <Compile Include="../../BetterGenshinImpact/Service/Agent/AgentRecoveryUi.cs" Link="AgentRecoveryUi.cs" />
@@ -2198,9 +2202,44 @@ diff --git a/BetterGenshinImpact/Core/Config/PathingPartyConfig.cs b/BetterGensh
      // 切换队伍前是否前往须弥七天神像
      [ObservableProperty]
 diff --git a/BetterGenshinImpact/GameTask/AutoPathing/PathExecutor.cs b/BetterGenshinImpact/GameTask/AutoPathing/PathExecutor.cs
+index 5be50ff..00c8e52 100644
 --- a/BetterGenshinImpact/GameTask/AutoPathing/PathExecutor.cs
 +++ b/BetterGenshinImpact/GameTask/AutoPathing/PathExecutor.cs
-@@ -476,10 +476,17 @@
+@@ -1,4 +1,5 @@
+ using BetterGenshinImpact.Core.Input;
++using BetterGenshinImpact.Service.Agent;
+ using BetterGenshinImpact.Core.Config;
+ using BetterGenshinImpact.GameTask.AutoFight.Assets;
+ using BetterGenshinImpact.GameTask.AutoFight.Model;
+@@ -252,6 +253,7 @@ public partial class PathExecutor
+                 }
+                 catch (HandledException handledException)
+                 {
++                    if (PartyConfig.VerifiedCommissionCombat) throw;
+                     SuccessEnd = true;
+                     break;
+                 }
+@@ -284,11 +286,19 @@ public partial class PathExecutor
+                 }
+                 catch (RetryException retryException)
+                 {
++                    // Recovery may teleport to another region. Never walk the old
++                    // no-teleport route from the statue or skip its prerequisite actions.
++                    if (PartyConfig.VerifiedCommissionCombat)
++                        throw new InvalidOperationException("commission_route_recovery_requires_restart", retryException);
+                     StartSkipOtherOperations();
+                     Logger.LogWarning(retryException.Message);
+                 }
+                 catch (RetryNoCountException retryException)
+                 {
++                    // Recovery may teleport to another region. Never walk the old
++                    // no-teleport route from the statue or skip its prerequisite actions.
++                    if (PartyConfig.VerifiedCommissionCombat)
++                        throw new InvalidOperationException("commission_route_recovery_requires_restart", retryException);
+                     //特殊情况下，重试不消耗次数
+                     i--;
+                     StartSkipOtherOperations();
+@@ -476,10 +486,17 @@ public partial class PathExecutor
          // 必须放在这里，因为要通过队伍识别来得到最终结果
          var pathingConditionConfig = TaskContext.Instance().Config.PathingConditionConfig;
          var skipPartySwitch = PartyConfig.SkipPartySwitch;
@@ -2218,7 +2257,15 @@ diff --git a/BetterGenshinImpact/GameTask/AutoPathing/PathExecutor.cs b/BetterGe
          }
  
          // 校验角色是否存在
-@@ -887,6 +894,11 @@
+@@ -775,6 +792,7 @@ public partial class PathExecutor
+         // 连续偏角>5°持续状态的起始时间（配合帧数下限使用，替代原纯帧计数）
+         DateTime beyondAngleStartTime = DateTime.MinValue;
+         var hurryOnState = new HurryOnState();
++        var flightInput = new AgentFlightInput();
+ 
+         // 按下w，一直走
+         InputHub.Foreground.SimulateAction(GIActions.MoveForward, KeyType.KeyDown);
+@@ -887,6 +905,11 @@ public partial class PathExecutor
                              await _trapEscaper.RotateAndMove();
                              await _trapEscaper.MoveTo(waypoint);
                              InputHub.Foreground.SimulateAction(GIActions.MoveForward, KeyType.KeyDown);
@@ -2230,6 +2277,49 @@ diff --git a/BetterGenshinImpact/GameTask/AutoPathing/PathExecutor.cs b/BetterGe
                              Logger.LogInformation("卡死脱离结束");
                              continue;
                          }
+@@ -927,7 +950,8 @@ public partial class PathExecutor
+             }
+ 
+             // 赶路逻辑（使用角色技能加速赶路）
+-            var hurryOnResult = await TryHurryOnAsync(diff, waypoint, distance, screen, num, hurryOnState);
++            var hurryOnResult = !(PartyConfig.VerifiedCommissionCombat && waypoint.MoveMode == MoveModeEnum.Fly.Code)
++                && await TryHurryOnAsync(diff, waypoint, distance, screen, num, hurryOnState);
+             if (hurryOnResult)
+             {
+                 // continue 会跳过底部 await Delay(...)，
+@@ -940,8 +964,21 @@ public partial class PathExecutor
+             // 根据指定方式进行移动
+             if (waypoint.MoveMode == MoveModeEnum.Fly.Code)
+             {
+-                var isFlying = Bv.GetMotionStatus(screen) == MotionStatus.Fly;
+-                if (!isFlying)
++                // Rotation/skills may have changed the scene since the loop capture.
++                using var flightScreen = CaptureToRectArea();
++                var isFlying = Bv.GetMotionStatus(flightScreen) == MotionStatus.Fly;
++                if (PartyConfig.VerifiedCommissionCombat)
++                {
++                    if (flightInput.ShouldOpen(isFlying, Environment.TickCount64))
++                    {
++                        Logger.LogInformation("委托飞行：发送跨帧开翼按键");
++                        await AgentFlightInput.Pulse(
++                            () => InputHub.Foreground.SimulateAction(GIActions.Jump, KeyType.KeyDown),
++                            () => InputHub.Foreground.SimulateAction(GIActions.Jump, KeyType.KeyUp),
++                            Delay, ct);
++                    }
++                }
++                else if (!isFlying)
+                 {
+                     Debug.WriteLine("未进入飞行状态，按下空格");
+                     InputHub.Foreground.SimulateAction(GIActions.Jump);
+@@ -1125,7 +1162,7 @@ public partial class PathExecutor
+     {
+         if (waypoint.MoveMode == MoveModeEnum.Fly.Code && waypoint.Action == ActionEnum.StopFlying.Code)
+         {
+-            await ActionFactory.GetBeforeHandler(ActionEnum.StopFlying.Code).RunAsync(ct, waypoint);
++            await ActionFactory.GetBeforeHandler(ActionEnum.StopFlying.Code).RunAsync(ct, waypoint, PartyConfig);
+         }
+     }
+ 
 diff --git a/BetterGenshinImpact/GameTask/AutoFight/AutoFightParam.cs b/BetterGenshinImpact/GameTask/AutoFight/AutoFightParam.cs
 --- a/BetterGenshinImpact/GameTask/AutoFight/AutoFightParam.cs
 +++ b/BetterGenshinImpact/GameTask/AutoFight/AutoFightParam.cs
@@ -2306,3 +2396,139 @@ diff --git a/BetterGenshinImpact/GameTask/AutoPathing/Handler/AutoFightHandler.c
          }
  
          //根据怪物标签，调整拾取配置
+diff --git a/BetterGenshinImpact/GameTask/AutoPathing/Handler/StopFlyingHandler.cs b/BetterGenshinImpact/GameTask/AutoPathing/Handler/StopFlyingHandler.cs
+index 5158712..c4bf5d1 100644
+--- a/BetterGenshinImpact/GameTask/AutoPathing/Handler/StopFlyingHandler.cs
++++ b/BetterGenshinImpact/GameTask/AutoPathing/Handler/StopFlyingHandler.cs
+@@ -1,4 +1,7 @@
+ using BetterGenshinImpact.Core.Input;
++using System;
++using BetterGenshinImpact.Service.Agent;
++using BetterGenshinImpact.Core.Config;
+ using System.Threading;
+ using System.Threading.Tasks;
+ using BetterGenshinImpact.Core.Simulator.Extensions;
+@@ -13,6 +16,28 @@ public class StopFlyingHandler : IActionHandler
+ {
+     public async Task RunAsync(CancellationToken ct, WaypointForTrack? waypointForTrack = null, object? config = null)
+     {
++        if (config is PathingPartyConfig { VerifiedCommissionCombat: true })
++        {
++            // Do not blindly toggle SPACE twice. At low altitude that closes
++            // the glider and can hit the ground before the attack is delivered.
++            Logger.LogInformation("委托飞行：跨帧下落攻击，不执行自由落体窗口");
++            await AgentFlightInput.Pulse(
++                () => InputHub.Foreground.SimulateAction(GIActions.NormalAttack, KeyType.KeyDown),
++                () => InputHub.Foreground.SimulateAction(GIActions.NormalAttack, KeyType.KeyUp),
++                Delay, ct);
++            var stable = 0;
++            for (var sample = 0; sample < 50; sample++)
++            {
++                await Delay(100, ct);
++                using var frame = CaptureToRectArea();
++                var normal = Bv.IsInMainUi(frame) && Bv.GetMotionStatus(frame) == MotionStatus.Normal;
++                stable = normal ? stable + 1 : 0;
++                // The first missing flight hint is often an animation, not landing.
++                if (sample >= 19 && stable >= 3) return;
++            }
++            throw new InvalidOperationException("commission_landing_not_observed");
++        }
++
+         // 如果有参数，先自由落体，然后恢复飞行
+         if (waypointForTrack != null
+             && !string.IsNullOrEmpty(waypointForTrack.ActionParams)
+diff --git a/BetterGenshinImpact/Service/Agent/AgentFlightInput.cs b/BetterGenshinImpact/Service/Agent/AgentFlightInput.cs
+new file mode 100644
+index 0000000..c67c327
+--- /dev/null
++++ b/BetterGenshinImpact/Service/Agent/AgentFlightInput.cs
+@@ -0,0 +1,34 @@
++using System;
++using System.Threading;
++using System.Threading.Tasks;
++
++namespace BetterGenshinImpact.Service.Agent;
++
++/// <summary>Frame-visible flight input with debounce; the UI hint is not a wing detector.</summary>
++internal sealed class AgentFlightInput
++{
++    private long _lastPulse = long.MinValue;
++    private int _missing;
++    private bool _seenAirborne;
++
++    internal bool ShouldOpen(bool airborne, long milliseconds)
++    {
++        if (airborne) { _seenAirborne = true; _missing = 0; return false; }
++        _missing++;
++        if (_seenAirborne && _missing < 2) return false;
++        if (_lastPulse != long.MinValue && milliseconds - _lastPulse < 700) return false;
++        _lastPulse = milliseconds;
++        _missing = 0;
++        return true;
++    }
++
++    internal static async Task Pulse(Action down, Action up, Func<int, CancellationToken, Task> delay,
++        CancellationToken ct)
++    {
++        ct.ThrowIfCancellationRequested();
++        try { down(); await delay(100, ct); }
++        finally { up(); }
++        // Input and captured frames lag the game. Never inspect the pre-input frame.
++        await delay(300, ct);
++    }
++}
+diff --git a/Test/BetterGenshinImpact.AgentBridge.Tests/AgentFlightInputTests.cs b/Test/BetterGenshinImpact.AgentBridge.Tests/AgentFlightInputTests.cs
+new file mode 100644
+index 0000000..c045112
+--- /dev/null
++++ b/Test/BetterGenshinImpact.AgentBridge.Tests/AgentFlightInputTests.cs
+@@ -0,0 +1,49 @@
++using BetterGenshinImpact.Service.Agent;
++using Xunit;
++
++namespace BetterGenshinImpact.AgentBridge.Tests;
++
++public class AgentFlightInputTests
++{
++    [Fact]
++    public void MissingHintCannotRapidlyToggleGlider()
++    {
++        var input = new AgentFlightInput();
++        Assert.True(input.ShouldOpen(false, 0));
++        Assert.False(input.ShouldOpen(false, 300));
++        Assert.False(input.ShouldOpen(true, 500));
++        Assert.False(input.ShouldOpen(false, 1000)); // one bad frame
++        Assert.True(input.ShouldOpen(false, 1200));
++        Assert.False(input.ShouldOpen(false, 1300));
++        Assert.False(input.ShouldOpen(true, 1500));
++    }
++
++    [Fact]
++    public async Task PulseSpansFramesAndWaitsForFreshCapture()
++    {
++        var calls = new List<string>();
++        await AgentFlightInput.Pulse(() => calls.Add("down"), () => calls.Add("up"),
++            (ms, ct) => { calls.Add(ms.ToString()); return Task.CompletedTask; }, default);
++        Assert.Equal(new[] { "down", "100", "up", "300" }, calls);
++    }
++
++    [Fact]
++    public async Task CancellationReleasesHeldInput()
++    {
++        var calls = new List<string>();
++        using var source = new CancellationTokenSource();
++        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => AgentFlightInput.Pulse(
++            () => calls.Add("down"), () => calls.Add("up"),
++            (ms, ct) => { source.Cancel(); ct.ThrowIfCancellationRequested(); return Task.CompletedTask; }, source.Token));
++        Assert.Equal(new[] { "down", "up" }, calls);
++    }
++
++    [Fact]
++    public async Task AlreadyCancelledNeverPresses()
++    {
++        var calls = new List<string>();
++        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => AgentFlightInput.Pulse(
++            () => calls.Add("down"), () => calls.Add("up"), Task.Delay, new CancellationToken(true)));
++        Assert.Empty(calls);
++    }
++}
