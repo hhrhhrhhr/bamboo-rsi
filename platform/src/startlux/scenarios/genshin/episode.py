@@ -103,7 +103,9 @@ class EpisodeAudit(AuditLog):
         super().__call__(event)
         kind = event.get("type")
         changed = True
-        if kind == "policy_loaded":
+        if kind == "workload_bound":
+            self.value["workload"] = event["workload"]
+        elif kind == "policy_loaded":
             self.value["policy"] = event
         elif kind == "rsi_assignment":
             self.value["rsi_assignment"] = event

@@ -14,6 +14,7 @@ import time
 import uuid
 
 from ...core.settings import DecisionSettings as Settings
+from ...core.settings import TransientProviderError
 from ...core.releases import PolicyStore
 from ...core.scenario import PolicyBundle, GUARDRAILS
 from ...core.contracts import canonical_hash
@@ -41,7 +42,7 @@ class GameReadyTimeout(TimeoutError):
 
 def error_fields(error: Exception) -> dict:
     fields = {"error_type": type(error).__name__}
-    if isinstance(error, (DesktopSetupError, GameReadyTimeout, RecordingError)):
+    if isinstance(error, (DesktopSetupError, GameReadyTimeout, RecordingError, TransientProviderError)):
         fields["error_code"] = error.code
     armed = getattr(error, "_startlux_execution_armed", None)
     if type(armed) is bool:
@@ -106,7 +107,7 @@ def prepare_daily_pack(source: Path, destination: Path, model: str) -> TaskPack:
     return TaskPack.load(destination)
 
 
-def load_run_policy(pack: TaskPack, home: Path, *, scope=None, rehearsal=None, run_mode="autonomous"):
+def load_run_policy(pack: TaskPack, home: Path, *, scope=None, rehearsal=None, run_mode="autonomous", workload="daily"):
     """Freeze an explicitly installed trial pack or a previously validated release."""
     base = PolicyBundle(scenario="genshin.daily", model=pack.manifest.decision_model,
         base_hash=pack.policy_base_hash, files={"instructions.md": pack.instructions,
@@ -121,6 +122,8 @@ def load_run_policy(pack: TaskPack, home: Path, *, scope=None, rehearsal=None, r
             raise ValueError("RSI requires an explicit scope and no external trial override")
         store = RSIStore(home)
         active = store.active(base)
+        if workload == "resin" and store.read("active.json").get("campaign_hash"):
+            raise DesktopSetupError("prospective_campaign_active", "Separate resin development cannot contaminate the daily campaign")
         if rehearsal:
             if run_mode != "development":
                 raise ValueError("RSI rehearsal must be marked development")
@@ -131,6 +134,8 @@ def load_run_policy(pack: TaskPack, home: Path, *, scope=None, rehearsal=None, r
                     base.scenario, base.base_hash, base.model):
                 raise ValueError("rehearsal changed fixed resources or model")
             enrollment = None
+        elif workload == "resin":
+            bundle, enrollment = active, None
         else:
             bundle, enrollment = store.assignment(scope)
         instructions, identity, source = bundle.policy.instructions, bundle.policy.identity, "rsi"
@@ -202,6 +207,11 @@ def wait_for_game_ready(session, uid, *, seconds=180, audit=None):
                 elif all(anchor in compact_text for anchor in
                          ("选择委托任务倾向地域", "每日委托奖励", "历练点阶段奖励")):
                     scene = "commission_journal"
+                elif state.facts.get("resin_workload") is True and all(anchor in compact_text for anchor in
+                         ("秘境入口", "单人挑战", "匹配挑战", "收取奖励消耗")):
+                    # A failed pre-entry check can leave this menu open. Resin scan
+                    # uses ReturnMainUi before reading the map; no challenge is clicked here.
+                    scene = "domain_entry"
             readiness = (state.scope.account_id, state.facts.get("account_verified"),
                          state.facts.get("foreground"), scene)
             if audit is not None and readiness != previous_readiness:
@@ -210,10 +220,10 @@ def wait_for_game_ready(session, uid, *, seconds=180, audit=None):
             if state.scope.account_id != uid:
                 raise DesktopSetupError("account_mismatch", "game UID differs from the requested account")
             if (state.facts.get("account_verified") is True and state.facts.get("foreground") is True
-                    and scene in {"world", "map", "paimon_menu", "commission_journal", "cold_defeat"}):
+                    and scene in {"world", "map", "paimon_menu", "commission_journal", "cold_defeat", "domain_entry"}):
                 if audit is not None and scene != "world":
                     audit({"type": "startup_menu_ready", "scene": scene,
-                           "recovery_skill": "daily.scan", "input_executed": False})
+                           "recovery_skill": "resin.scan" if state.facts.get("resin_workload") is True else "daily.scan", "input_executed": False})
                 return state
         except (OSError, TimeoutError, ConnectionError, RuntimeError):
             pass  # Read-only startup/capture failures can be retried before arming.
@@ -250,6 +260,7 @@ def main():
     parser.add_argument("--assets", type=Path, help="daily execution resources for source development runs")
     parser.add_argument("--run-mode", choices=["development", "autonomous"], default="development",
                         help="development runs never qualify as unattended daily evidence")
+    parser.add_argument("--workload", choices=["daily", "resin"], default="daily")
     parser.add_argument("--rsi-rehearsal", help="explicit candidate hash for a development-only rehearsal")
     parser.add_argument("--run-id", help="interrupted attempt to reconcile using its original input pipe")
     parser.add_argument("--host-directory", type=Path, help="native host directory for execution provenance")
@@ -297,6 +308,9 @@ def execute_run(args, config):
     run = home / "runs" / (time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8])
     run.mkdir(parents=True)
     audit = EpisodeAudit(run, config, args.run_mode)
+    workload = getattr(args, "workload", "daily")
+    audit({"type": "workload_bound", "workload": workload})
+    resin_plan = None
     provider = controller = heartbeat = None
     combat_lease = None
     recording = None
@@ -307,6 +321,11 @@ def execute_run(args, config):
     execution_armed = False
     termination = "error"
     try:
+        if workload == "resin":
+            from .resin import load_plan
+            resin_plan = load_plan(home)
+            if not resin_plan.enabled or config.get("record_video") is not True:
+                raise DesktopSetupError("resin_disabled", "Resin plan and game recording must be enabled")
         unresolved = audit.unresolved_attempts()
         if unresolved:
             audit({"type": "prior_execution_unresolved", "run_ids": unresolved})
@@ -319,7 +338,7 @@ def execute_run(args, config):
         from .episode import configured_scope
         launch_scope = configured_scope(config)
         pack, policy_event = load_run_policy(pack, home, scope=launch_scope,
-            rehearsal=getattr(args, "rsi_rehearsal", None), run_mode=args.run_mode)
+            rehearsal=getattr(args, "rsi_rehearsal", None), run_mode=args.run_mode, workload=workload)
         audit(policy_event)
         if "rsi" in policy_event:
             from .rsi import RSIStore
@@ -351,11 +370,22 @@ def execute_run(args, config):
                     raise ValueError("combat candidate requires an owned native host")
                 combat_lease = CombatLease(host_directory, bundle.combat, run / "combat-install.json")
                 combat_lease.apply()
-        audit({"type": "execution_build", "files": execution_build(host_directory)})
+        if resin_plan is not None:
+            from .resin import bind_pack
+            pack = bind_pack(pack, resin_plan)
+            audit({"type": "resin_plan_bound", "plan": resin_plan.model_dump(), "plan_sha256": canonical_hash(resin_plan.model_dump())})
+        build_files = execution_build(host_directory)
+        audit({"type": "execution_build", "files": build_files})
+        goal_version = canonical_hash({"runtime": audit.value["runtime_sha256"],
+            "native": build_files, "policy": policy_event.get("policy_hash"),
+            "bundle": policy_event.get("rsi", {}).get("bundle_hash")})
         host_config = {"binding": {"account_id": config["uid"], "server_id": config["server_id"],
                         "server_utc_offset_minutes": config["server_utc_offset_minutes"], "region": "Mondstadt"},
                        "pack_directory": str(pack.root), "timed_route_policy": route_policy.model_dump(),
-                       "record_video": config.get("record_video", False)}
+                       "record_video": config.get("record_video", False), "goal_version": goal_version,
+                       "run_mode": args.run_mode}
+        if resin_plan is not None:
+            host_config["resin_plan"] = resin_plan.model_dump()
         host_path = home / "bridge.json"
         host_path.write_text(json.dumps(host_config), encoding="utf-8")
         emit({"status": "pack_ready", "bridge_config": str(host_path), "pipe": args.pipe,
@@ -374,6 +404,15 @@ def execute_run(args, config):
                 time.sleep(0.5)
         if descriptor is None:
             raise DesktopSetupError("bridge_unavailable", "execution host did not connect")
+        from .recovery_actions import recovery_options
+        expected_recovery = [option.model_dump() for option in recovery_options()]
+        if descriptor.get("daily_recovery_v1") is not True or descriptor.get("recovery_catalog") != expected_recovery:
+            raise DesktopSetupError("bridge_mismatch", "native bounded recovery catalog differs from the frozen program")
+        if resin_plan is not None and (descriptor.get("resin_v1") is not True
+                or descriptor.get("resin_plan") != resin_plan.model_dump()):
+            raise DesktopSetupError("bridge_mismatch", "Native resin plan differs from frozen workload")
+        audit({"type": "recovery_catalog_bound", "catalog_sha256": canonical_hash(expected_recovery),
+               "goal_version": goal_version, "attempt_limit_per_quest_per_day": 2})
         if config.get("record_video", False):
             if descriptor.get("game_video_v1") is not True:
                 raise DesktopSetupError("bridge_mismatch", "native game recording is unavailable")
@@ -394,7 +433,8 @@ def execute_run(args, config):
         provider._headers["Authorization"] = "Bearer " + key
         key = ""
         controller = RealtimeRunner(session, provider, pack.instructions, model=pack.manifest.decision_model, audit=audit,
-            checkpoint_enabled="command_checkpoint_v1" in descriptor.get("capabilities", []))
+            checkpoint_enabled="command_checkpoint_v1" in descriptor.get("capabilities", []),
+            supervision_enabled=descriptor.get("daily_goal_control_v1") is True)
         heartbeat = ExecutionHeartbeat(controller)
         heartbeat.thread.start()
         emit({"status": "waiting_for_game"})
@@ -404,7 +444,7 @@ def execute_run(args, config):
         if "rsi" in policy_event and ready.scope != launch_scope:
             raise DesktopSetupError("scope_changed", "account or game day changed before input")
         recovery = DecisionRecovery(audit.recovery_history(ready.scope))
-        controller.checkpoint_count = sum(r["reason"] in {"timeout_journal_checkpoint", "failure_journal_checkpoint"}
+        controller.checkpoint_count = sum(r["reason"] in {"timeout_journal_checkpoint", "failure_journal_checkpoint", "decision_journal_checkpoint"}
                                          for r in audit.recovery_history(ready.scope))
         # Treat an ambiguous arm response conservatively during host cleanup.
         execution_armed = True
@@ -442,7 +482,12 @@ def execute_run(args, config):
             termination = "budget_exhausted"
         observation = session.observe()
         audit({"type": "final_observation", "observation": audit.archive_observation(observation)})
-        report = report_from_observation(observation, expected_scope=ready.scope)
+        if resin_plan is not None:
+            from .resin import report_from_resin
+            report = report_from_resin(observation, run, resin_plan)
+            atomic_json(run / "resin-report.json", report)
+        else:
+            report = report_from_observation(observation, expected_scope=ready.scope)
         report.update(termination_reason=termination, trace=str(run / "trace.jsonl"),
                       evidence_origin="windows_live", model=config["model_id"])
         (run / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -455,6 +500,9 @@ def execute_run(args, config):
                   **error_fields(error), "trace": str(run / "trace.jsonl"),
                   "evidence_origin": "windows_live" if execution_armed else "windows_startup",
                   "model": config["model_id"]}
+        if resin_plan is not None:
+            report.update(workload="resin", autonomous_promotion_eligible=False)
+            atomic_json(run / "resin-report.json", report)
         (run / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
         audit({"type": "daily_report", "report": report})
         raise

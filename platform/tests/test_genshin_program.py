@@ -202,6 +202,54 @@ def test_structured_proposal_and_failure_packet_cannot_change_paths_or_see_heldo
         replacements_from(proposal, context)
 
 
+def test_feedback_redaction_keeps_hashes_but_removes_account_and_credentials():
+    digest = "a" * 27 + "1234567890" + "b" * 27
+    result = redact({"sha256": digest, "note": "UID:1234567890 UID1234567890 key:sk-" + "x" * 30})
+    assert result["sha256"] == digest
+    assert "1234567890" not in result["note"] and "sk-" not in result["note"]
+
+
+def test_optimizer_transport_failure_has_private_hashed_diagnostics(tmp_path):
+    from startlux.scenarios.genshin.rsi_codex import invocation_failure
+    raw = b'{"type":"turn.failed","error":{"message":"workspace routing discovery timed out"}}\n'
+    (tmp_path / "events.jsonl").write_bytes(raw)
+    (tmp_path / "stderr.log").write_text("private data must not be copied")
+    assert invocation_failure(tmp_path, RuntimeError()) == "workspace_routing_timeout"
+    report = json.loads((tmp_path / "invocation-failure.json").read_bytes())
+    assert report["diagnostic_sha256"]["events.jsonl"] == sha(raw)
+    assert report["game_input"] is False and report["eligible_for_client_release"] is False
+    assert "private data" not in json.dumps(report)
+    assert (tmp_path / "events.jsonl").read_bytes() == raw
+
+
+@pytest.mark.parametrize("mode", ["clean", "reconnect", "fallback", "failed", "no_completion", "second_turn",
+    "error", "late_error", "command_execution", "file_change", "mcp_tool_call", "web_search", "unknown_tool", "mismatch"])
+def test_proposal_event_validation_recovers_transport_but_rejects_failed_or_tool_using_turns(mode):
+    from startlux.scenarios.genshin.rsi_codex import validate_proposal_events
+    proposal = {"summary": "test", "hypothesis": "test", "changes": []}
+    events = [{"type": "thread.started"}, {"type": "turn.started"}]
+    if mode == "reconnect":
+        events.append({"type": "error", "message": "Reconnecting... 2/5 (workspace routing discovery timed out)"})
+    elif mode == "fallback":
+        events.append({"type": "item.completed", "item": {"type": "error",
+            "message": "Falling back from WebSockets to HTTPS transport. workspace routing discovery timed out"}})
+    elif mode == "failed": events.append({"type": "turn.failed"})
+    elif mode == "error": events.append({"type": "error", "message": "unrecognized failure"})
+    elif mode in {"command_execution", "file_change", "mcp_tool_call", "web_search", "unknown_tool"}:
+        events.append({"type": "item.started", "item": {"type": mode}})
+    events.extend([{"type": "item.completed", "item": {"type": "agent_message", "text": json.dumps(proposal)}},
+                   {"type": "turn.completed"}])
+    if mode == "no_completion": events.pop()
+    if mode == "second_turn": events.extend([{"type": "turn.started"}, {"type": "turn.completed"}])
+    if mode == "late_error": events.append({"type": "error", "message": "Reconnecting... 2/5 (timeout)"})
+    if mode == "mismatch": proposal = {**proposal, "summary": "different file"}
+    if mode in {"clean", "reconnect", "fallback"}:
+        recovered = validate_proposal_events(events, proposal)
+        assert len(recovered) == (0 if mode == "clean" else 1)
+    else:
+        with pytest.raises(ValueError): validate_proposal_events(events, proposal)
+
+
 def test_project_backend_reserves_budget_and_builds_without_promoting(program_environment, tmp_path):
     env = program_environment
     parent = env.store.active(env.base)
@@ -223,6 +271,51 @@ def test_project_backend_reserves_budget_and_builds_without_promoting(program_en
     assert (directory / "output/candidate.patch").is_file()
     assert optimize(service, job, proposer=proposer)["status"] == "optimizer_failed"
     assert env.store.read("codex-budget/budget.json")["used"] == 1
+
+
+@pytest.mark.parametrize("native_passes", [True, False])
+def test_codex_combat_patch_inherits_parent_and_requires_native_validation(program_environment, native_passes):
+    from startlux.scenarios.genshin.rsi_codex import COMBAT
+    env = program_environment
+    parent = env.store.active(env.base)
+    baseline = "钟离 e(hold)\n班尼特 e, q\n夜兰 e, q\n神里绫华 attack(1)\n"
+    proposed = "钟离 wait(0.05)\n班尼特 e, q\n夜兰 attack(2), charge(2)\n神里绫华 wait(0.05)\n"
+    calls = []
+    def validate(patch, output):
+        calls.append(patch)
+        if not native_passes:
+            raise ValueError("native parser rejected combat")
+    service = SimpleNamespace(store=env.store, base=env.base,
+        config={"root": str(env.root), "max_codex_calls": 1}, native_validator=validate)
+    directory = env.store.root / "jobs/combat-job"
+    directory.mkdir(parents=True)
+    atomic_json(directory / "parent.json", parent.model_dump())
+    job = {"id": "combat-job", "windows_output": str(directory / "output"), "parent_program": env.baseline,
+           "training_days": ["2026-10-01"], "heldout_days": [],
+           "combat_baseline": {"script": baseline, "sha256": sha(baseline.encode())},
+           "operator_feedback": [{"game_day": "2026-10-01", "observation": "training"},
+                                 {"game_day": "2026-10-02", "observation": "heldout"}]}
+    def proposer(context, *args, **kwargs):
+        assert context["operator_feedback"] == [{"game_day": "2026-10-01", "observation": "training"}]
+        return {"summary": "synthetic combat proposal", "hypothesis": "unit test only", "changes": [
+            {"path": COMBAT, "content": proposed, "before_sha256": context["sources"][COMBAT]["sha256"]}]}
+    result = optimize(service, job, proposer=proposer)
+    assert len(calls) == 1
+    assert env.store.active(env.base) == parent
+    assert not result["eligible_for_client_release"]
+    if not native_passes:
+        assert result["status"] == "optimizer_failed"
+        assert not (directory / "output/candidate.json").exists()
+        return
+    assert result["status"] == "candidate_ready"
+    candidate = Bundle.model_validate_json((directory / "output/candidate.json").read_bytes())
+    assert candidate.program == env.baseline and candidate.parent == parent.identity
+    assert candidate.combat.script == proposed
+    assert candidate.combat.before_sha256 == sha(baseline.encode())
+    # A descendant's proposal must start from the accepted strategy, not the
+    # installation template. This check does not simulate a real promotion.
+    inherited = proposal_context(job, candidate, env.programs)
+    assert inherited["sources"][COMBAT] == {"sha256": sha(proposed.encode()), "content": proposed}
 
 
 @pytest.mark.parametrize("mode,campaign", [("development", None), ("autonomous", "a" * 64)])

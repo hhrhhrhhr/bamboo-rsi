@@ -37,7 +37,7 @@ async function check(scores, expected) {
 
 async function checkExecution(type, healFails = false) {
   const calls = [];
-  const context = {CommissionBasic: {}, file: {readTextSync:()=>''},
+  const context = {CommissionBasic: {}, agentJournal: {}, file: {readTextSync:()=>''},
     settings: {operation:'execute',questJson:JSON.stringify({type,name:'fixture',location:'fixture'})},
     StepProcessorLoader:{loadStepProcessors(){}},
     genshin:{async returnMainUi(){calls.push('world');}, async tpToStatueOfTheSeven(){
@@ -54,9 +54,9 @@ async function checkExecution(type, healFails = false) {
   }
 }
 
-async function checkTalkSteps(fail) {
+async function checkTalkSteps(fail, receipt = false) {
   const calls = [];
-  const context = {CommissionBasic:{}, file:{readTextSync:()=>''},
+  const context = {CommissionBasic:{}, agentJournal: {ReportPhase() {}}, file:{readTextSync:()=>''},
     settings:{operation:'execute',questJson:JSON.stringify({type:'talk',name:'fixture',location:'fixture'})},
     UI:{UIUtils:{isInMainUI:()=>true}}, StepProcessorLoader:{loadStepProcessors(){}},
     genshin:{async returnMainUi(){calls.push('world');}}, setGameMetrics(){},sleep:async()=>{},
@@ -66,6 +66,7 @@ async function checkTalkSteps(fail) {
       async processStep(step,ctx){
         assert.equal(ctx.commissionName,'fixture');
         calls.push(step);
+        if (receipt && step==='route.json') context.agentJournal.CommissionRewardReceived = true;
         if(fail && step==='route.json')throw new Error('route recovery requires restart');
       },
       async executeTalkCommission(name,location){
@@ -77,7 +78,7 @@ async function checkTalkSteps(fail) {
     assert.deepEqual(calls,['world','track','route.json','world']);
   } else {
     await vm.runInNewContext(source,context);
-    assert.deepEqual(calls,['world','track','route.json','F','world']);
+    assert.deepEqual(calls,receipt ? ['world','track','route.json'] : ['world','track','route.json','F','world']);
   }
 }
 
@@ -91,5 +92,6 @@ async function checkTalkSteps(fail) {
   await checkExecution('fight',true);
   await checkTalkSteps(true);
   await checkTalkSteps(false);
-  process.stdout.write('9 adapter boundary checks passed\n');
+  await checkTalkSteps(false, true);
+  process.stdout.write('10 adapter boundary checks passed\n');
 })().catch(error => { console.error(error); process.exitCode = 1; });

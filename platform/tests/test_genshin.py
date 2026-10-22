@@ -455,6 +455,28 @@ def test_startup_recovers_only_a_verified_foreground_game_menu(monkeypatch, scen
     assert not session.starts
 
 
+@pytest.mark.parametrize("workload,verified,foreground,text,ready", [
+    (True, True, True, "秘境入口 单人挑战 匹配挑战 收取奖励消耗20", True),
+    (False, True, True, "秘境入口 单人挑战 匹配挑战 收取奖励消耗20", False),
+    (True, False, True, "秘境入口 单人挑战 匹配挑战 收取奖励消耗20", False),
+    (True, True, False, "秘境入口 单人挑战 匹配挑战 收取奖励消耗20", False),
+    (True, True, True, "单人挑战 匹配挑战 收取奖励消耗20", False),
+])
+def test_resin_startup_can_recover_verified_domain_entry(monkeypatch, workload, verified, foreground, text, ready):
+    session = FixtureSession()
+    session.current = observation(facts={"scene": "unknown", "account_verified": verified,
+        "foreground": foreground, "ocr_text": text, "resin_workload": workload})
+    clock = iter([0, 0, 3])
+    monkeypatch.setattr("startlux.scenarios.genshin.desktop.time.monotonic", lambda: next(clock))
+    monkeypatch.setattr("startlux.scenarios.genshin.desktop.time.sleep", lambda seconds: None)
+    if ready:
+        wait_for_game_ready(session, SCOPE.account_id, seconds=2)
+    else:
+        with pytest.raises(GameReadyTimeout):
+            wait_for_game_ready(session, SCOPE.account_id, seconds=2)
+    assert not session.starts
+
+
 def test_unknown_error_messages_cannot_leak_credentials_into_events():
     event = error_fields(RuntimeError("untrusted-provider-secret"))
     assert event == {"error_type": "RuntimeError"}
@@ -535,8 +557,10 @@ def test_failure_after_arming_releases_input_and_does_not_claim_startup_cleanup_
         armed = False
 
         def describe(self):
+            from startlux.scenarios.genshin.recovery_actions import recovery_options
             manifest = next((tmp_path / "runs").glob("*/pack/manifest.json"))
             return {"decision_model": "startlux-decision-27b-autothink",
+                    "daily_recovery_v1": True, "recovery_catalog": [o.model_dump() for o in recovery_options()],
                     "timed_route_policy": {"skip_optional_fights_below_seconds": 0},
                     "manifest_file_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest()}
 
@@ -616,8 +640,10 @@ def test_empty_catalog_from_a_missed_readiness_frame_rechecks_without_executing(
         missed = False
 
         def describe(self):
+            from startlux.scenarios.genshin.recovery_actions import recovery_options
             manifest = next((tmp_path / "runs").glob("*/pack/manifest.json"))
             return {"decision_model": "startlux-decision-27b-autothink",
+                    "daily_recovery_v1": True, "recovery_catalog": [o.model_dump() for o in recovery_options()],
                     "timed_route_policy": {"skip_optional_fights_below_seconds": 0},
                     "manifest_file_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest()}
 

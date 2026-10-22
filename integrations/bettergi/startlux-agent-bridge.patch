@@ -1,8 +1,9 @@
 diff --git a/BetterGenshinImpact.AgentBridge/AgentCommandHost.cs b/BetterGenshinImpact.AgentBridge/AgentCommandHost.cs
 new file mode 100644
+index 0000000..f82d0de
 --- /dev/null
 +++ b/BetterGenshinImpact.AgentBridge/AgentCommandHost.cs
-@@ -0,0 +1,340 @@
+@@ -0,0 +1,350 @@
 +using System.Diagnostics;
 +using Newtonsoft.Json.Linq;
 +
@@ -215,16 +216,26 @@ new file mode 100644
 +
 +    // A deadline checkpoint cancels only the expiring daily skill. It never
 +    // arms a halted host or changes the generation set by a manual stop.
-+    public JObject Checkpoint(string commandId)
++    public JObject Checkpoint(string commandId, long? reviewFrameId = null)
 +    {
 +        CancellationTokenSource? cancellation;
 +        lock (_gate)
 +        {
 +            if (_halted || _releaseFailed || !_commands.TryGetValue(commandId, out var state)
 +                || state.Command.Value<long>("control_generation") != _generation
-+                || state.Command["option"]?.Value<string>("skill") != "daily.execute")
++                || state.Command["option"]?.Value<string>("skill") is not ("daily.execute" or "daily.recover"))
 +                return ResultFor(commandId, "unknown", "checkpoint_unavailable");
-+            if (Stopwatch.GetTimestamp() < state.Deadline)
++            if (reviewFrameId is long frameId &&
++                (_metadata.Value<bool?>("daily_goal_control_v1") != true
++                || !_frames.TryGetValue(frameId, out var review) || frameId != _frameId
++                || Stopwatch.GetElapsedTime(review.CapturedAt).TotalSeconds > 2
++                || review.Observation.Value<long>("control_generation") != _generation
++                || !JToken.DeepEquals(review.Observation["scope"], state.Command["scope"])
++                || review.Observation["facts"]?.Value<bool?>("daily_review_interruptible") != true
++                || review.Observation["facts"]?.Value<bool?>("foreground") != true
++                || review.Observation["facts"]?.Value<bool?>("account_verified") != true))
++                return ResultFor(commandId, "running", "review_checkpoint_not_safe");
++            if (reviewFrameId == null && Stopwatch.GetTimestamp() < state.Deadline)
 +                return ResultFor(commandId, "running", "checkpoint_before_deadline");
 +            cancellation = ReferenceEquals(_active, state) ? _activeCancellation : null;
 +        }
@@ -345,6 +356,7 @@ new file mode 100644
 +}
 diff --git a/BetterGenshinImpact.AgentBridge/AgentPipeServer.cs b/BetterGenshinImpact.AgentBridge/AgentPipeServer.cs
 new file mode 100644
+index 0000000..5b2fd32
 --- /dev/null
 +++ b/BetterGenshinImpact.AgentBridge/AgentPipeServer.cs
 @@ -0,0 +1,113 @@
@@ -430,7 +442,7 @@ new file mode 100644
 +                        case "start": result = await host.StartAsync(data, timeout.Token).ConfigureAwait(false); break;
 +                        case "reconcile": result = host.Reconcile(data.Value<string>("command_id") ?? ""); break;
 +                        case "cancel": result = host.Cancel(data.Value<string>("command_id") ?? ""); break;
-+                        case "checkpoint": result = host.Checkpoint(data.Value<string>("command_id") ?? ""); break;
++                        case "checkpoint": result = host.Checkpoint(data.Value<string>("command_id") ?? "", data.Value<long?>("review_frame_id")); break;
 +                        case "stop": host.Stop(); result = new JObject(); break;
 +                        default: throw new ArgumentException("Unsupported agent operation.");
 +                    }
@@ -463,7 +475,7 @@ new file mode 100644
 +}
 diff --git a/BetterGenshinImpact.AgentBridge/BetterGenshinImpact.AgentBridge.csproj b/BetterGenshinImpact.AgentBridge/BetterGenshinImpact.AgentBridge.csproj
 new file mode 100644
-index 00000000..dc33ff40
+index 0000000..dc33ff4
 --- /dev/null
 +++ b/BetterGenshinImpact.AgentBridge/BetterGenshinImpact.AgentBridge.csproj
 @@ -0,0 +1,11 @@
@@ -479,7 +491,7 @@ index 00000000..dc33ff40
 +  </ItemGroup>
 +</Project>
 diff --git a/BetterGenshinImpact/App.xaml.cs b/BetterGenshinImpact/App.xaml.cs
-index e301c68e..330986bb 100644
+index e301c68..330986b 100644
 --- a/BetterGenshinImpact/App.xaml.cs
 +++ b/BetterGenshinImpact/App.xaml.cs
 @@ -161,6 +161,7 @@ public partial class App : Application
@@ -491,7 +503,7 @@ index e301c68e..330986bb 100644
                  services.AddSingleton<INavigationService, NavigationService>();
                  services.AddSingleton<IUpdateService, UpdateService>();
 diff --git a/BetterGenshinImpact/BetterGenshinImpact.csproj b/BetterGenshinImpact/BetterGenshinImpact.csproj
-index e27f6e7f..e512631d 100644
+index e27f6e7..e512631 100644
 --- a/BetterGenshinImpact/BetterGenshinImpact.csproj
 +++ b/BetterGenshinImpact/BetterGenshinImpact.csproj
 @@ -1,5 +1,8 @@
@@ -503,14 +515,410 @@ index e27f6e7f..e512631d 100644
  	<PropertyGroup>
  		<AssemblyName>BetterGI</AssemblyName>
  		<Version>0.66.2-alpha.2</Version>
+diff --git a/BetterGenshinImpact/Core/Config/PathingPartyConfig.cs b/BetterGenshinImpact/Core/Config/PathingPartyConfig.cs
+index 4909718..cd78ccc 100644
+--- a/BetterGenshinImpact/Core/Config/PathingPartyConfig.cs
++++ b/BetterGenshinImpact/Core/Config/PathingPartyConfig.cs
+@@ -40,6 +40,17 @@ public partial class PathingPartyConfig : ObservableObject
+ 
+     [JsonIgnore]
+     public bool SkipPartySwitch { get; set; }
++
++    // Runtime-only override for timed tasks; never changes persisted user settings.
++    [JsonIgnore]
++    public bool SuppressOptionalBattleLoot { get; set; }
++
++    // Per-command pinned daily route, never a persisted user preference.
++    [JsonIgnore]
++    public bool VerifiedCommissionCombat { get; set; }
++
++    [JsonIgnore]
++    public int TimedRouteSkipCombatBelowSeconds { get; set; }
+     
+     // 切换队伍前是否前往须弥七天神像
+     [ObservableProperty]
+diff --git a/BetterGenshinImpact/GameTask/AutoDomain/AutoDomainParam.cs b/BetterGenshinImpact/GameTask/AutoDomain/AutoDomainParam.cs
+index a3ec711..78f9bd9 100644
+--- a/BetterGenshinImpact/GameTask/AutoDomain/AutoDomainParam.cs
++++ b/BetterGenshinImpact/GameTask/AutoDomain/AutoDomainParam.cs
+@@ -7,6 +7,8 @@ namespace BetterGenshinImpact.GameTask.AutoDomain;
+ 
+ public class AutoDomainParam : BaseTaskParam<AutoDomainTask>
+ {
++    public Service.Agent.AgentResinSession? AgentResin { get; set; }
++
+     public int DomainRoundNum { get; set; }
+ 
+     public string CombatStrategyPath { get; set; }
+diff --git a/BetterGenshinImpact/GameTask/AutoDomain/AutoDomainTask.cs b/BetterGenshinImpact/GameTask/AutoDomain/AutoDomainTask.cs
+index 1d1cd98..2cefa4a 100644
+--- a/BetterGenshinImpact/GameTask/AutoDomain/AutoDomainTask.cs
++++ b/BetterGenshinImpact/GameTask/AutoDomain/AutoDomainTask.cs
+@@ -98,7 +98,8 @@ public partial class AutoDomainTask : ISoloTask<Dictionary<string, int>>
+     {
+         _taskParam = taskParam;
+ 
+-        _config = TaskContext.Instance().Config.AutoDomainConfig;
++        _config = taskParam.AgentResin == null ? TaskContext.Instance().Config.AutoDomainConfig
++            : new AutoDomainConfig { AutoEat = false, ReviveRetryCount = 1, AutoArtifactSalvage = false };
+ 
+         if (AutoFightParam.ComboStrategyName.Equals(_taskParam.CombatStrategyPath))
+         {
+@@ -219,6 +220,7 @@ public partial class AutoDomainTask : ISoloTask<Dictionary<string, int>>
+                 }
+                 catch (RetryException e)
+                 {
++                    if (_taskParam.AgentResin != null) throw;
+                     // 只有选择了秘境的时候才会重试
+                     if (!string.IsNullOrEmpty(_taskParam.DomainName))
+                     {
+@@ -645,6 +647,8 @@ public partial class AutoDomainTask : ISoloTask<Dictionary<string, int>>
+             await Delay(300, _ct);
+         }
+ 
++        if (_taskParam.AgentResin != null) await _taskParam.AgentResin.SelectAndVerify(_ct);
++
+         // 点击单人挑战确认并等待队伍界面--使用图像模版匹配的方法，也可以使用文字OCR的方法识别“单人挑战”直到消失
+         await NewRetry.WaitForElementAppear(
+             ElementRecognition.Get("PartyBtnChooseView"),
+@@ -976,7 +980,7 @@ public partial class AutoDomainTask : ISoloTask<Dictionary<string, int>>
+             return;
+         }
+ 
+-        var s = TaskContext.Instance().Config.AutoDomainConfig.FightEndDelay;
++        var s = _config.FightEndDelay;
+         if (s > 0)
+         {
+             Logger.LogInformation("战斗结束后等待 {Second} 秒", s);
+@@ -1354,6 +1358,7 @@ public partial class AutoDomainTask : ISoloTask<Dictionary<string, int>>
+     /// </summary>
+     private async Task<bool> GettingTreasure()
+     {
++        if (_taskParam.AgentResin != null) return await _taskParam.AgentResin.Claim(_ct);
+         bool isLastTurn = false;
+         // 等待窗口弹出
+         await Delay(300, _ct);
+diff --git a/BetterGenshinImpact/GameTask/AutoFight/AutoFightParam.cs b/BetterGenshinImpact/GameTask/AutoFight/AutoFightParam.cs
+index 25b742a..0e8abb9 100644
+--- a/BetterGenshinImpact/GameTask/AutoFight/AutoFightParam.cs
++++ b/BetterGenshinImpact/GameTask/AutoFight/AutoFightParam.cs
+@@ -41,6 +41,7 @@ public class AutoFightParam : BaseTaskParam<AutoFightTask>
+     public string CombatStrategyPath { get; set; }
+ 
+     public bool FightFinishDetectEnabled { get; set; } = false;
++    public bool RequireFightCompletion { get; set; } = false;
+     public bool PickDropsAfterFightEnabled { get; set; } = true;
+     public int PickDropsAfterFightSeconds { get; set; } = 15;
+     public int BattleThresholdForLoot { get; set; } = -1;
+diff --git a/BetterGenshinImpact/GameTask/AutoFight/AutoFightTask.cs b/BetterGenshinImpact/GameTask/AutoFight/AutoFightTask.cs
+index b1cd85a..bd1d1a0 100644
+--- a/BetterGenshinImpact/GameTask/AutoFight/AutoFightTask.cs
++++ b/BetterGenshinImpact/GameTask/AutoFight/AutoFightTask.cs
+@@ -529,6 +529,8 @@ public class AutoFightTask : ISoloTask
+ 
+         try
+         {
++            if (_taskParam.RequireFightCompletion && timeOutFlag)
++                throw new TimeoutException("必需战斗未确认结束，不能继续委托路线");
+             // 基于经验值检测结果的拾取判断
+             if (_taskParam.KazuhaPickupEnabled && _taskParam.ExpBasedPickupEnabled && expDetector != null)
+             {
+diff --git a/BetterGenshinImpact/GameTask/AutoPathing/Handler/AutoFightHandler.cs b/BetterGenshinImpact/GameTask/AutoPathing/Handler/AutoFightHandler.cs
+index 9770790..34fd43c 100644
+--- a/BetterGenshinImpact/GameTask/AutoPathing/Handler/AutoFightHandler.cs
++++ b/BetterGenshinImpact/GameTask/AutoPathing/Handler/AutoFightHandler.cs
+@@ -8,6 +8,8 @@ using System.Threading;
+ using System.Threading.Tasks;
+ using BetterGenshinImpact.GameTask.AutoPathing.Model;
+ using Microsoft.Extensions.Logging;
++using BetterGenshinImpact.Service.Agent;
++using BetterGenshinImpact.Core.Recognition.OCR;
+ 
+ namespace BetterGenshinImpact.GameTask.AutoPathing.Handler;
+ 
+@@ -26,6 +28,16 @@ internal class AutoFightHandler : IActionHandler
+ 
+     private async Task StartFight(CancellationToken ct, object? config = null , WaypointForTrack? waypointForTrack = null)
+     {
++        ct.ThrowIfCancellationRequested();
++        if (config is PathingPartyConfig { SuppressOptionalBattleLoot: true } timed)
++        {
++            AgentTimedRoutePolicy.Validate(timed.TimedRouteSkipCombatBelowSeconds);
++            using var capture = TaskControl.CaptureToRectArea();
++            var seconds = AgentTimedRoutePolicy.RemainingSeconds(OcrFactory.Paddle.Ocr(capture.SrcMat));
++            ct.ThrowIfCancellationRequested();
++            _logger.LogInformation("限时计时器检查：剩余 {Seconds} 秒；必须清除此处魔物，禁止跳过战斗",
++                seconds);
++        }
+         TaskControl.Logger.LogInformation("执行 {Text}", "自动战斗");
+         // 爷们要战斗
+         AutoFightParam taskParams = null;
+@@ -40,6 +52,23 @@ internal class AutoFightHandler : IActionHandler
+             taskParams = new AutoFightParam(GetFightStrategy(), TaskContext.Instance().Config.AutoFightConfig);
+         }
+ 
++        if (config is PathingPartyConfig { VerifiedCommissionCombat: true } or
++            PathingPartyConfig { SuppressOptionalBattleLoot: true })
++        {
++            taskParams.FightFinishDetectEnabled = true;
++            taskParams.RequireFightCompletion = true;
++            taskParams.PickDropsAfterFightEnabled = false;
++            taskParams.KazuhaPickupEnabled = false;
++            taskParams.QinDoublePickUp = false;
++            // The joined continuous targeting loop reacquires off-screen enemies.
++            // Keep the legacy fire-and-forget movement seeker disabled here.
++            taskParams.EnableCombatTargeting = true;
++            taskParams.TargetingDetectionInterval = 100;
++            taskParams.FinishDetectConfig.RotateFindEnemyEnabled = false;
++            taskParams.FinishDetectConfig.SkipFightEndCheckWhenEnemyVisible = true;
++            _logger.LogInformation("每日委托启用持续索敌、核验战斗结束并跳过可选拾取");
++        }
++
+         //根据怪物标签，调整拾取配置
+         if (waypointForTrack!=null && waypointForTrack.EnableMonsterLootSplit)
+         {
+diff --git a/BetterGenshinImpact/GameTask/AutoPathing/Handler/StopFlyingHandler.cs b/BetterGenshinImpact/GameTask/AutoPathing/Handler/StopFlyingHandler.cs
+index 5158712..c4bf5d1 100644
+--- a/BetterGenshinImpact/GameTask/AutoPathing/Handler/StopFlyingHandler.cs
++++ b/BetterGenshinImpact/GameTask/AutoPathing/Handler/StopFlyingHandler.cs
+@@ -1,4 +1,7 @@
+ using BetterGenshinImpact.Core.Input;
++using System;
++using BetterGenshinImpact.Service.Agent;
++using BetterGenshinImpact.Core.Config;
+ using System.Threading;
+ using System.Threading.Tasks;
+ using BetterGenshinImpact.Core.Simulator.Extensions;
+@@ -13,6 +16,28 @@ public class StopFlyingHandler : IActionHandler
+ {
+     public async Task RunAsync(CancellationToken ct, WaypointForTrack? waypointForTrack = null, object? config = null)
+     {
++        if (config is PathingPartyConfig { VerifiedCommissionCombat: true })
++        {
++            // Do not blindly toggle SPACE twice. At low altitude that closes
++            // the glider and can hit the ground before the attack is delivered.
++            Logger.LogInformation("委托飞行：跨帧下落攻击，不执行自由落体窗口");
++            await AgentFlightInput.Pulse(
++                () => InputHub.Foreground.SimulateAction(GIActions.NormalAttack, KeyType.KeyDown),
++                () => InputHub.Foreground.SimulateAction(GIActions.NormalAttack, KeyType.KeyUp),
++                Delay, ct);
++            var stable = 0;
++            for (var sample = 0; sample < 50; sample++)
++            {
++                await Delay(100, ct);
++                using var frame = CaptureToRectArea();
++                var normal = Bv.IsInMainUi(frame) && Bv.GetMotionStatus(frame) == MotionStatus.Normal;
++                stable = normal ? stable + 1 : 0;
++                // The first missing flight hint is often an animation, not landing.
++                if (sample >= 19 && stable >= 3) return;
++            }
++            throw new InvalidOperationException("commission_landing_not_observed");
++        }
++
+         // 如果有参数，先自由落体，然后恢复飞行
+         if (waypointForTrack != null
+             && !string.IsNullOrEmpty(waypointForTrack.ActionParams)
+diff --git a/BetterGenshinImpact/GameTask/AutoPathing/PathExecutor.cs b/BetterGenshinImpact/GameTask/AutoPathing/PathExecutor.cs
+index 5be50ff..00c8e52 100644
+--- a/BetterGenshinImpact/GameTask/AutoPathing/PathExecutor.cs
++++ b/BetterGenshinImpact/GameTask/AutoPathing/PathExecutor.cs
+@@ -1,4 +1,5 @@
+ using BetterGenshinImpact.Core.Input;
++using BetterGenshinImpact.Service.Agent;
+ using BetterGenshinImpact.Core.Config;
+ using BetterGenshinImpact.GameTask.AutoFight.Assets;
+ using BetterGenshinImpact.GameTask.AutoFight.Model;
+@@ -252,6 +253,7 @@ public partial class PathExecutor
+                 }
+                 catch (HandledException handledException)
+                 {
++                    if (PartyConfig.VerifiedCommissionCombat) throw;
+                     SuccessEnd = true;
+                     break;
+                 }
+@@ -284,11 +286,19 @@ public partial class PathExecutor
+                 }
+                 catch (RetryException retryException)
+                 {
++                    // Recovery may teleport to another region. Never walk the old
++                    // no-teleport route from the statue or skip its prerequisite actions.
++                    if (PartyConfig.VerifiedCommissionCombat)
++                        throw new InvalidOperationException("commission_route_recovery_requires_restart", retryException);
+                     StartSkipOtherOperations();
+                     Logger.LogWarning(retryException.Message);
+                 }
+                 catch (RetryNoCountException retryException)
+                 {
++                    // Recovery may teleport to another region. Never walk the old
++                    // no-teleport route from the statue or skip its prerequisite actions.
++                    if (PartyConfig.VerifiedCommissionCombat)
++                        throw new InvalidOperationException("commission_route_recovery_requires_restart", retryException);
+                     //特殊情况下，重试不消耗次数
+                     i--;
+                     StartSkipOtherOperations();
+@@ -476,10 +486,17 @@ public partial class PathExecutor
+         // 必须放在这里，因为要通过队伍识别来得到最终结果
+         var pathingConditionConfig = TaskContext.Instance().Config.PathingConditionConfig;
+         var skipPartySwitch = PartyConfig.SkipPartySwitch;
++        var suppressOptionalBattleLoot = PartyConfig.SuppressOptionalBattleLoot;
++        var verifiedCommissionCombat = PartyConfig.VerifiedCommissionCombat;
++        var timedRouteSkipCombatBelowSeconds = PartyConfig.TimedRouteSkipCombatBelowSeconds;
+         if (PartyConfig is { Enabled: false })
+         {
+             PartyConfig = pathingConditionConfig.BuildPartyConfigByCondition(_combatScenes);
+             PartyConfig.SkipPartySwitch = skipPartySwitch;
++            // 条件配置重建后仍保留本次限时路线的运行时限制。
++            PartyConfig.SuppressOptionalBattleLoot = suppressOptionalBattleLoot;
++            PartyConfig.VerifiedCommissionCombat = verifiedCommissionCombat;
++            PartyConfig.TimedRouteSkipCombatBelowSeconds = timedRouteSkipCombatBelowSeconds;
+         }
+ 
+         // 校验角色是否存在
+@@ -775,6 +792,7 @@ public partial class PathExecutor
+         // 连续偏角>5°持续状态的起始时间（配合帧数下限使用，替代原纯帧计数）
+         DateTime beyondAngleStartTime = DateTime.MinValue;
+         var hurryOnState = new HurryOnState();
++        var flightInput = new AgentFlightInput();
+ 
+         // 按下w，一直走
+         InputHub.Foreground.SimulateAction(GIActions.MoveForward, KeyType.KeyDown);
+@@ -887,6 +905,11 @@ public partial class PathExecutor
+                             await _trapEscaper.RotateAndMove();
+                             await _trapEscaper.MoveTo(waypoint);
+                             InputHub.Foreground.SimulateAction(GIActions.MoveForward, KeyType.KeyDown);
++                            // Recovery changes both position and orientation. Give normal
++                            // traversal a fresh sampling window; old samples otherwise
++                            // trigger another recovery immediately and exhaust the budget.
++                            prevPositions.Clear();
++                            lastPositionRecord = DateTime.UtcNow;
+                             Logger.LogInformation("卡死脱离结束");
+                             continue;
+                         }
+@@ -927,7 +950,8 @@ public partial class PathExecutor
+             }
+ 
+             // 赶路逻辑（使用角色技能加速赶路）
+-            var hurryOnResult = await TryHurryOnAsync(diff, waypoint, distance, screen, num, hurryOnState);
++            var hurryOnResult = !(PartyConfig.VerifiedCommissionCombat && waypoint.MoveMode == MoveModeEnum.Fly.Code)
++                && await TryHurryOnAsync(diff, waypoint, distance, screen, num, hurryOnState);
+             if (hurryOnResult)
+             {
+                 // continue 会跳过底部 await Delay(...)，
+@@ -940,8 +964,21 @@ public partial class PathExecutor
+             // 根据指定方式进行移动
+             if (waypoint.MoveMode == MoveModeEnum.Fly.Code)
+             {
+-                var isFlying = Bv.GetMotionStatus(screen) == MotionStatus.Fly;
+-                if (!isFlying)
++                // Rotation/skills may have changed the scene since the loop capture.
++                using var flightScreen = CaptureToRectArea();
++                var isFlying = Bv.GetMotionStatus(flightScreen) == MotionStatus.Fly;
++                if (PartyConfig.VerifiedCommissionCombat)
++                {
++                    if (flightInput.ShouldOpen(isFlying, Environment.TickCount64))
++                    {
++                        Logger.LogInformation("委托飞行：发送跨帧开翼按键");
++                        await AgentFlightInput.Pulse(
++                            () => InputHub.Foreground.SimulateAction(GIActions.Jump, KeyType.KeyDown),
++                            () => InputHub.Foreground.SimulateAction(GIActions.Jump, KeyType.KeyUp),
++                            Delay, ct);
++                    }
++                }
++                else if (!isFlying)
+                 {
+                     Debug.WriteLine("未进入飞行状态，按下空格");
+                     InputHub.Foreground.SimulateAction(GIActions.Jump);
+@@ -1125,7 +1162,7 @@ public partial class PathExecutor
+     {
+         if (waypoint.MoveMode == MoveModeEnum.Fly.Code && waypoint.Action == ActionEnum.StopFlying.Code)
+         {
+-            await ActionFactory.GetBeforeHandler(ActionEnum.StopFlying.Code).RunAsync(ct, waypoint);
++            await ActionFactory.GetBeforeHandler(ActionEnum.StopFlying.Code).RunAsync(ct, waypoint, PartyConfig);
+         }
+     }
+ 
+diff --git a/BetterGenshinImpact/Service/Agent/AgentCommissionReceipt.cs b/BetterGenshinImpact/Service/Agent/AgentCommissionReceipt.cs
+new file mode 100644
+index 0000000..15b7e9b
+--- /dev/null
++++ b/BetterGenshinImpact/Service/Agent/AgentCommissionReceipt.cs
+@@ -0,0 +1,67 @@
++using System;
++using System.Text.RegularExpressions;
++using OpenCvSharp;
++
++namespace BetterGenshinImpact.Service.Agent;
++
++/// <summary>Fresh commission reward toast, never inventory or a combat timeout.</summary>
++internal sealed class AgentCommissionReceipt
++{
++    private bool _armed;
++    private long? _bannerAt;
++    private long? _firstReceiptAt;
++    private long? _lastReceiptAt;
++    internal bool Received { get; private set; }
++    internal int? Amount { get; private set; }
++
++    internal bool Observe(long milliseconds, string banner, string loot, bool primogemPopup = false)
++    {
++        if (Received) return true;
++        banner = Regex.Replace(banner, @"\s+", "");
++        loot = Regex.Replace(loot, @"\s+", "");
++        var completed = banner.Contains("委托完成", StringComparison.Ordinal);
++        // The configured Paddle V6 omits the multiplication glyph in real toasts.
++        var primogems = Regex.IsMatch(loot, @"原石[×xX*]?10(?![0-9])");
++        var commissionReward = loot.Contains("委托奖励", StringComparison.Ordinal);
++        // Do not inherit a toast left over from the previous selected skill.
++        if (!_armed)
++        {
++            _armed = !completed && !primogems && !commissionReward && !primogemPopup;
++            return false;
++        }
++        if (completed) _bannerAt = milliseconds;
++        var recentBanner = _bannerAt is long at && milliseconds >= at && milliseconds - at <= 8000;
++        if (!(primogems && (commissionReward || recentBanner)) && !(primogemPopup && recentBanner))
++        {
++            _firstReceiptAt = _lastReceiptAt = null;
++            return false;
++        }
++        if (_lastReceiptAt is not long last || milliseconds <= last || milliseconds - last > 1500)
++            _firstReceiptAt = milliseconds;
++        _lastReceiptAt = milliseconds;
++        // Require two temporally separate observations; a single OCR hit is insufficient.
++        Received = milliseconds - _firstReceiptAt!.Value >= 200;
++        if (Received) Amount = primogems ? 10 : null; // An icon alone proves no numeric delta.
++        return Received;
++    }
++
++    internal static bool HasPrimogemPopup(Mat normalizedFrame, Mat template)
++    {
++        // The central obtained-item card only; inventory and left-hand item lists
++        // are outside this ROI. Caller additionally requires a fresh completion banner.
++        using var center = normalizedFrame.SubMat(new Rect(820, 460, 280, 160));
++        using var bgr = new Mat();
++        if (center.Channels() == 4) Cv2.CvtColor(center, bgr, ColorConversionCodes.BGRA2BGR);
++        else center.CopyTo(bgr);
++        foreach (var scale in new[] { 0.70, 0.75, 0.80 })
++        {
++            using var icon = new Mat();
++            Cv2.Resize(template, icon, new Size(), scale, scale);
++            using var scores = new Mat();
++            Cv2.MatchTemplate(bgr, icon, scores, TemplateMatchModes.CCoeffNormed);
++            Cv2.MinMaxLoc(scores, out _, out double best);
++            if (best >= 0.85) return true;
++        }
++        return false;
++    }
++}
 diff --git a/BetterGenshinImpact/Service/Agent/AgentDailyJournal.cs b/BetterGenshinImpact/Service/Agent/AgentDailyJournal.cs
 new file mode 100644
-index 0000000..f6f4065
+index 0000000..a3edf7f
 --- /dev/null
 +++ b/BetterGenshinImpact/Service/Agent/AgentDailyJournal.cs
-@@ -0,0 +1,318 @@
+@@ -0,0 +1,490 @@
 +using System;
 +using System.Collections.Generic;
++using System.Diagnostics;
 +using System.IO;
 +using System.Linq;
 +using System.Security.Cryptography;
@@ -519,6 +927,7 @@ index 0000000..f6f4065
 +using System.Threading.Tasks;
 +using BetterGenshinImpact.Core.Script;
 +using BetterGenshinImpact.GameTask.Common;
++using BetterGenshinImpact.GameTask;
 +using BetterGenshinImpact.GameTask.Common.Job;
 +using BetterGenshinImpact.Core.Recognition.OCR;
 +using Microsoft.ClearScript;
@@ -529,6 +938,8 @@ index 0000000..f6f4065
 +using BetterGenshinImpact.GameTask.AutoPathing.Model;
 +using BetterGenshinImpact.GameTask.AutoTrackPath;
 +using BetterGenshinImpact.GameTask.Common.BgiVision;
++using BetterGenshinImpact.Core.Input;
++using BetterGenshinImpact.Core.Simulator.Extensions;
 +
 +namespace BetterGenshinImpact.Service.Agent;
 +
@@ -548,10 +959,18 @@ index 0000000..f6f4065
 +    private bool _needsScan = true;
 +    private long _frame;
 +    private int? _pendingVerification;
++    private readonly AgentGoalProgress _goal;
++    private JObject? _commissionReceipt;
++    private bool _receiptStopped;
++    private readonly Dictionary<string, string> _receiptImages = new();
++    public bool CommissionRewardReceived { get { lock (_gate) return _receiptStopped; } }
++    public void ReportPhase(string phase) { lock (_gate) _goal.Phase(phase); }
++    internal bool ReviewInterruptible { get { lock (_gate) return !_goal.TimedRoute; } }
 +
-+    internal AgentDailyJournal(Dictionary<string, byte[]> resources, int timedRouteThreshold = 0)
++    internal AgentDailyJournal(Dictionary<string, byte[]> resources, AgentGoalMemory memory, int timedRouteThreshold = 0)
 +    {
 +        _resources = resources;
++        _goal = new AgentGoalProgress(memory);
 +        _timedRouteThreshold = AgentTimedRoutePolicy.Validate(timedRouteThreshold);
 +    }
 +
@@ -565,6 +984,8 @@ index 0000000..f6f4065
 +            {
 +                ["daily_needs_scan"] = _needsScan, ["daily_all_complete"] = complete,
 +                ["daily_reward_claimed"] = _reward?.Value<bool>("claimed") == true,
++                ["commission_reward_receipt"] = _commissionReceipt?.DeepClone(),
++                ["daily_goal"] = _goal.Snapshot(),
 +                ["daily_evidence"] = new JObject
 +                {
 +                    ["expected_quest_ids"] = new JArray(_rows.Select(r => $"{r["id"]}:{r["name"]}")),
@@ -575,14 +996,18 @@ index 0000000..f6f4065
 +            for (var slot = 1; slot <= 4; slot++)
 +            {
 +                var row = _rows.FirstOrDefault(r => r.Value<int>("id") == slot);
-+                facts[$"daily_slot_{slot}_pending"] = !_needsScan && valid && row != null
++                var eligible = !_needsScan && valid && row != null
 +                    && _evidence.TryGetValue(slot, out var evidence) && !evidence.Value<bool>("completed")
 +                    && row.Value<bool>("supported") && row.Value<string>("country") == "蒙德"
 +                    && row.Value<string>("type") is "fight" or "talk"
 +                    && !string.IsNullOrWhiteSpace(row.Value<string>("location"))
 +                    && row.Value<string>("location") is not ("未知地点" or "识别失败" or "已完成");
++                facts[$"daily_slot_{slot}_pending"] = eligible && _goal.Available(slot);
++                facts[$"daily_slot_{slot}_retry"] = eligible && _goal.CanRetry(slot);
++                facts[$"daily_slot_{slot}_local_recovery"] = eligible && _goal.LocalRecovery(slot)
++                    && row!.Value<string>("type") == "fight";
 +            }
-+            return (facts, _images.Values.ToArray());
++            return (facts, _images.Values.Concat(_receiptImages.Values).ToArray());
 +        }
 +    }
 +
@@ -609,6 +1034,7 @@ index 0000000..f6f4065
 +            // stable identities while binding each proof to its visible row.
 +            // Commit only after all names and statuses have been validated.
 +            var bound = AgentJournalRows.Bind(_rows, rows, _scanEvidence);
++            _goal.BindRows(bound.Rows);
 +            _rows = bound.Rows;
 +            _evidence.Clear();
 +            foreach (var pair in bound.Evidence) _evidence.Add(pair.Key, pair.Value);
@@ -617,8 +1043,9 @@ index 0000000..f6f4065
 +            _needsScan = false;
 +            if (_pendingVerification is int slot)
 +            {
-+                if (!_evidence.TryGetValue(slot, out var completed) || !completed.Value<bool>("completed"))
-+                    throw new InvalidDataException("Selected commission did not become complete in the journal; no automatic retry.");
++                // An incomplete commission is valid evidence for replanning,
++                // not a failed scan or a reason to abandon the other quests.
++                _goal.Verify(_evidence.TryGetValue(slot, out var completed) && completed.Value<bool>("completed"));
 +                _pendingVerification = null;
 +            }
 +        }
@@ -649,12 +1076,15 @@ index 0000000..f6f4065
 +    internal async Task ExecuteAsync(string skill, JObject arguments, JObject scope, CancellationToken ct)
 +    {
 +        JObject? quest = null;
++        string? recovery = null;
 +        bool firstScan = false;
 +        lock (_gate)
 +        {
++            _receiptStopped = false;
 +            if (_scope != null && !JToken.DeepEquals(_scope, scope))
 +                throw new InvalidOperationException("Daily account or game day changed.");
 +            _scope = (JObject)scope.DeepClone();
++            _goal.BindScope(scope);
 +            if (skill == "daily.scan")
 +            {
 +                firstScan = _rows.Count == 0;
@@ -662,12 +1092,22 @@ index 0000000..f6f4065
 +                _scanEvidence.Clear(); _scanImages.Clear();
 +                if (_reward != null) _reward = null;
 +            }
-+            else if (skill == "daily.execute")
++            else if (skill is "daily.execute" or "daily.recover")
 +            {
 +                var slot = arguments.Value<int>("slot");
-+                if (Snapshot().Facts.Value<bool>($"daily_slot_{slot}_pending") != true)
++                if (skill == "daily.recover")
++                {
++                    recovery = arguments.Value<string>("mode");
++                    if (recovery is not ("ranged" or "reposition_left" or "reposition_right" or "heal_retry"))
++                        throw new InvalidDataException("Unknown bounded recovery mode.");
++                }
++                var gate = recovery == null ? "pending" : recovery == "heal_retry" ? "retry" : "local_recovery";
++                if (Snapshot().Facts.Value<bool>($"daily_slot_{slot}_{gate}") != true)
 +                    throw new InvalidOperationException("Commission is not available for execution.");
 +                quest = (JObject)_rows.Single(r => r.Value<int>("id") == slot).DeepClone();
++                _goal.Begin(slot, quest.Value<string>("name")!, recovery ?? "default");
++                _commissionReceipt = null;
++                _receiptImages.Clear();
 +                _needsScan = true;
 +                _pendingVerification = slot;
 +            }
@@ -677,6 +1117,33 @@ index 0000000..f6f4065
 +                    throw new InvalidOperationException("Four completed commissions are required before claiming.");
 +            }
 +            else throw new InvalidDataException("Unsupported daily operation.");
++        }
++
++        if (recovery != null)
++        {
++            RequireRecoveryGround(ct);
++            ReportPhase("recover");
++            if (recovery == "heal_retry")
++            {
++                await new TpTask(ct).TpToStatueOfTheSeven();
++                await Task.Delay(5000, ct);
++                RequireRecoveryGround(ct);
++                using var capture = TaskControl.CaptureToRectArea();
++                if (Bv.CurrentAvatarIsLowHp(capture))
++                    throw new InvalidOperationException("Statue recovery did not clear the low health indicator.");
++                ReportPhase("prepare");
++                // Continue through the pinned original route. This changed
++                // preparation consumes the second attempt even if it fails.
++            }
++            else
++            {
++                using var monitoring = CancellationTokenSource.CreateLinkedTokenSource(ct);
++                var monitor = Task.Run(() => WatchCommissionReceiptAsync(quest!, monitoring.Token));
++                try { await RecoverCombatAsync(recovery, ct); }
++                finally { monitoring.Cancel(); await monitor.ConfigureAwait(false); }
++                ReportPhase("verify");
++                return; // Never claim kills or completion from this bounded burst.
++            }
 +        }
 +
 +        if (firstScan)
@@ -761,7 +1228,7 @@ index 0000000..f6f4065
 +            engine.AddHostObject("keyPress", (Action<string>)scriptInput.Press);
 +            // The standard JS wrapper catches path failures. Use a strict executor
 +            // and retain its failure independently of upstream catch/continue code.
-+            var routes = new AgentPinnedRoutes(_resources, ct, _timedRouteThreshold);
++            var routes = new AgentPinnedRoutes(_resources, ct, _timedRouteThreshold, ReportPhase);
 +            engine.AddHostObject("pathingScript", routes);
 +            engine.AddHostObject("agentJournal", this);
 +            engine.AddHostObject("settings", new PropertyBag
@@ -771,16 +1238,124 @@ index 0000000..f6f4065
 +                ["team"] = "", ["elementTeam"] = "", ["prepare"] = true,
 +                ["skipRecognition"] = false, ["skipCommissions"] = ""
 +            });
-+            using var interrupt = ct.Register(() => { CancellationContext.Instance.Cts.Cancel(); engine.Interrupt(); });
-+            ct.ThrowIfCancellationRequested();
-+            if (engine.Evaluate(Encoding.UTF8.GetString(_resources["agent-main.js"])) is Task task) await task;
-+            ct.ThrowIfCancellationRequested();
-+            scriptInput.VerifyDialogue();
-+            if (routes.Failed) throw new InvalidOperationException("A pinned commission route failed.");
++            using var interrupt = ct.Register(() =>
++            {
++                CancellationContext.Instance.Cancel();
++                // Every executing quest must join its native tasks before a new
++                // Decision skill; interrupting JS promises early loses that join.
++                if (quest == null) engine.Interrupt();
++            });
++            using var monitoring = CancellationTokenSource.CreateLinkedTokenSource(ct);
++            var receiptMonitor = quest == null ? Task.CompletedTask
++                : Task.Run(() => WatchCommissionReceiptAsync(quest, monitoring.Token));
++            try
++            {
++                ct.ThrowIfCancellationRequested();
++                if (engine.Evaluate(Encoding.UTF8.GetString(_resources["agent-main.js"])) is Task task) await task;
++                ct.ThrowIfCancellationRequested();
++                scriptInput.VerifyDialogue();
++                if (routes.Failed) throw new InvalidOperationException("A pinned commission route failed.");
++            }
++            finally
++            {
++                monitoring.Cancel();
++                await receiptMonitor.ConfigureAwait(false);
++            }
 +        }
 +        finally
 +        {
 +            try { Directory.Delete(directory, true); } catch (IOException) { }
++        }
++    }
++
++    private static void RequireRecoveryGround(CancellationToken ct)
++    {
++        ct.ThrowIfCancellationRequested();
++        using var capture = TaskControl.CaptureToRectArea();
++        if (!Bv.IsInMainUi(capture) || Bv.GetMotionStatus(capture) != MotionStatus.Normal)
++            throw new InvalidOperationException("Recovery requires a current grounded world view.");
++    }
++
++    private static async Task RecoverCombatAsync(string mode, CancellationToken ct)
++    {
++        var scenes = await RunnerContext.Instance.GetCombatScenes(ct)
++            ?? throw new InvalidOperationException("Party recognition is unavailable.");
++        scenes.BeforeTask(ct);
++        var ranged = scenes.GetAvatars().SingleOrDefault(a => a.Name == "夜兰")
++            ?? throw new InvalidOperationException("The bounded ranged recovery requires Yelan in the current party.");
++        RequireRecoveryGround(ct);
++        if (!ranged.TrySwitch(2)) throw new InvalidOperationException("Could not verify the ranged character switch.");
++        RequireRecoveryGround(ct);
++        if (mode is "reposition_left" or "reposition_right")
++        {
++            var move = mode == "reposition_left" ? GIActions.MoveLeft : GIActions.MoveRight;
++            try
++            {
++                InputHub.Foreground.SimulateAction(move, KeyType.KeyDown);
++                await Task.Delay(350, ct);
++            }
++            finally { InputHub.Foreground.SimulateAction(move, KeyType.KeyUp); }
++        }
++        var timer = Stopwatch.StartNew();
++        while (timer.Elapsed < TimeSpan.FromSeconds(15))
++        {
++            RequireRecoveryGround(ct);
++            using (var capture = TaskControl.CaptureToRectArea())
++                if (Bv.CurrentAvatarIsLowHp(capture))
++                    throw new InvalidOperationException("Low health prevents continued ranged recovery.");
++            ranged.Attack(); // One normal shot; never creates another Zhongli pillar.
++            ct.ThrowIfCancellationRequested();
++        }
++    }
++
++    private async Task WatchCommissionReceiptAsync(JObject quest, CancellationToken ct)
++    {
++        var detector = new AgentCommissionReceipt();
++        var clock = Stopwatch.StartNew();
++        try
++        {
++            using var primogemTemplate = BetterGenshinImpact.GameTask.GameTaskManager.LoadAssetImage(
++                @"Common\Element", "primogem.png", 1920, 1080);
++            while (!ct.IsCancellationRequested)
++            {
++                using var capture = TaskControl.CaptureToRectArea();
++                using var normalized = new Mat();
++                Cv2.Resize(capture.SrcMat, normalized, new Size(1920, 1080));
++                // Limit OCR to the completion banner and obtained-items toast.
++                // Inventory/shop text elsewhere cannot trigger this stop.
++                using var banner = normalized.SubMat(new Rect(450, 130, 1020, 170));
++                using var loot = normalized.SubMat(new Rect(65, 460, 440, 370));
++                var bannerText = OcrFactory.Paddle.Ocr(banner);
++                var lootText = OcrFactory.Paddle.Ocr(loot);
++                ct.ThrowIfCancellationRequested();
++                if (detector.Observe(clock.ElapsedMilliseconds, bannerText, lootText,
++                    AgentCommissionReceipt.HasPrimogemPopup(normalized, primogemTemplate)))
++                {
++                    lock (_gate)
++                    {
++                        _commissionReceipt = new JObject
++                        {
++                            ["quest_id"] = $"{quest["id"]}:{quest["name"]}",
++                            ["primogems"] = detector.Amount, ["observed_at"] = DateTimeOffset.UtcNow,
++                            ["requires_journal_verification"] = true,
++                            ["evidence"] = VisualEvidence("commission_primogem_receipt", capture.SrcMat, _receiptImages)
++                        };
++                        _receiptStopped = true;
++                    }
++                    // This is a task-completion stop, not an assertion that all
++                    // surrounding enemies died. Normal cancellation joins combat.
++                    CancellationContext.Instance.Cancel();
++                    return;
++                }
++                await Task.Delay(250, ct).ConfigureAwait(false);
++            }
++        }
++        catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
++        catch
++        {
++            // A failed observer cannot leave an unmonitored fight running.
++            CancellationContext.Instance.Cancel();
++            throw;
 +        }
 +    }
 +}
@@ -791,8 +1366,10 @@ index 0000000..f6f4065
 +    private readonly CancellationToken _token;
 +    internal bool Failed { get; private set; }
 +    private readonly int _timedRouteThreshold;
-+    internal AgentPinnedRoutes(Dictionary<string, byte[]> resources, CancellationToken token, int timedRouteThreshold = 0)
-+    { _resources = resources; _token = token; _timedRouteThreshold = AgentTimedRoutePolicy.Validate(timedRouteThreshold); }
++    private readonly Action<string>? _phase;
++    internal AgentPinnedRoutes(Dictionary<string, byte[]> resources, CancellationToken token, int timedRouteThreshold = 0,
++        Action<string>? phase = null)
++    { _resources = resources; _token = token; _timedRouteThreshold = AgentTimedRoutePolicy.Validate(timedRouteThreshold); _phase = phase; }
 +
 +    internal static PathingTask ParseResource(byte[] bytes)
 +    {
@@ -812,6 +1389,7 @@ index 0000000..f6f4065
 +            if (!_resources.TryGetValue(name, out var bytes))
 +                throw new InvalidDataException("Route is outside the pinned source pack.");
 +            var route = ParseResource(bytes);
++            _phase?.Invoke("route");
 +            var executor = new PathExecutor(_token);
 +            executor.PartyConfig.VerifiedCommissionCombat = true;
 +            // Optional looting previously consumed 45 seconds in this timed
@@ -823,18 +1401,1479 @@ index 0000000..f6f4065
 +            await executor.Pathing(route);
 +            _token.ThrowIfCancellationRequested();
 +            if (!executor.SuccessEnd) throw new InvalidOperationException("Route did not complete.");
++            _phase?.Invoke("verify");
 +        }
 +        catch { Failed = true; throw; }
 +    }
 +}
+diff --git a/BetterGenshinImpact/Service/Agent/AgentFlightInput.cs b/BetterGenshinImpact/Service/Agent/AgentFlightInput.cs
+new file mode 100644
+index 0000000..c67c327
+--- /dev/null
++++ b/BetterGenshinImpact/Service/Agent/AgentFlightInput.cs
+@@ -0,0 +1,34 @@
++using System;
++using System.Threading;
++using System.Threading.Tasks;
++
++namespace BetterGenshinImpact.Service.Agent;
++
++/// <summary>Frame-visible flight input with debounce; the UI hint is not a wing detector.</summary>
++internal sealed class AgentFlightInput
++{
++    private long _lastPulse = long.MinValue;
++    private int _missing;
++    private bool _seenAirborne;
++
++    internal bool ShouldOpen(bool airborne, long milliseconds)
++    {
++        if (airborne) { _seenAirborne = true; _missing = 0; return false; }
++        _missing++;
++        if (_seenAirborne && _missing < 2) return false;
++        if (_lastPulse != long.MinValue && milliseconds - _lastPulse < 700) return false;
++        _lastPulse = milliseconds;
++        _missing = 0;
++        return true;
++    }
++
++    internal static async Task Pulse(Action down, Action up, Func<int, CancellationToken, Task> delay,
++        CancellationToken ct)
++    {
++        ct.ThrowIfCancellationRequested();
++        try { down(); await delay(100, ct); }
++        finally { up(); }
++        // Input and captured frames lag the game. Never inspect the pre-input frame.
++        await delay(300, ct);
++    }
++}
+diff --git a/BetterGenshinImpact/Service/Agent/AgentGoalMemory.cs b/BetterGenshinImpact/Service/Agent/AgentGoalMemory.cs
+new file mode 100644
+index 0000000..3af2f2d
+--- /dev/null
++++ b/BetterGenshinImpact/Service/Agent/AgentGoalMemory.cs
+@@ -0,0 +1,123 @@
++using System;
++using System.IO;
++using System.Linq;
++using System.Security.Cryptography;
++using System.Text;
++using Newtonsoft.Json;
++using Newtonsoft.Json.Linq;
++
++namespace BetterGenshinImpact.Service.Agent;
++
++// Mutable evidence, never a completion oracle. Reserve durably BEFORE input;
++// an interrupted process consumes its reservation rather than granting a retry.
++public sealed class AgentGoalMemory
++{
++    private readonly string _root;
++    private readonly string _version;
++    private readonly string _run;
++    private JObject? _scope;
++    private string? _path;
++    public AgentGoalMemory(string root, string version, string run)
++    {
++        if (version.Length != 64 || version.Any(c => !Uri.IsHexDigit(c)) || string.IsNullOrWhiteSpace(run))
++            throw new InvalidDataException("Goal memory requires a bound program version and run.");
++        _root = Path.GetFullPath(root); _version = version; _run = run;
++        Directory.CreateDirectory(_root);
++        RejectLink(_root);
++    }
++    private static void RejectLink(string path)
++    {
++        if (File.Exists(path) || Directory.Exists(path))
++            if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0)
++                throw new InvalidDataException("Goal memory cannot contain links.");
++    }
++    public void Bind(JObject scope)
++    {
++        if (_scope != null && !JToken.DeepEquals(_scope, scope))
++            throw new InvalidOperationException("Goal memory account or game day changed.");
++        _scope = (JObject)scope.DeepClone();
++        var identity = new JObject { ["account_id"] = scope["account_id"],
++            ["server_id"] = scope["server_id"], ["game_day"] = scope["game_day"] };
++        if (identity.Properties().Any(p => p.Value.Type != JTokenType.String || string.IsNullOrWhiteSpace((string?)p.Value)))
++            throw new InvalidDataException("Incomplete goal memory scope.");
++        _path = Path.Combine(_root, Convert.ToHexString(SHA256.HashData(
++            Encoding.UTF8.GetBytes(identity.ToString(Formatting.None)))).ToLowerInvariant() + ".json");
++        Read(); // Corruption fails closed before any game input.
++    }
++    private JObject Read()
++    {
++        if (_path == null || _scope == null) throw new InvalidOperationException("Goal memory is not bound.");
++        RejectLink(_path);
++        if (!File.Exists(_path)) return new JObject { ["schema_version"] = 1,
++            ["scope"] = _scope.DeepClone(), ["attempts"] = new JArray() };
++        if (new FileInfo(_path).Length > 1024 * 1024) throw new InvalidDataException("Goal memory is too large.");
++        var data = JObject.Parse(File.ReadAllText(_path));
++        if (data.Value<int>("schema_version") != 1 || !JToken.DeepEquals(data["scope"], _scope)
++            || data["attempts"] is not JArray attempts || attempts.Count > 8
++            || attempts.Any(a => string.IsNullOrWhiteSpace(a.Value<string>("quest"))
++                || a.Value<string>("status") is not ("reserved" or "incomplete" or "completed")
++                || string.IsNullOrWhiteSpace(a.Value<string>("id")))
++            || attempts.Select(a => a.Value<string>("id")).Distinct().Count() != attempts.Count
++            || attempts.GroupBy(a => a.Value<string>("quest")).Any(g => g.Count() > 2))
++            throw new InvalidDataException("Goal memory is invalid; preserve it for review.");
++        return data;
++    }
++    private void Write(JObject data)
++    {
++        var temporary = _path + "." + Guid.NewGuid().ToString("N") + ".tmp";
++        using (var stream = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None))
++        {
++            var bytes = Encoding.UTF8.GetBytes(data.ToString(Formatting.Indented));
++            stream.Write(bytes); stream.Flush(true);
++        }
++        File.Move(temporary, _path!, true);
++    }
++    private FileStream Lease()
++    {
++        RejectLink(_root); RejectLink(Path.Combine(_root, "memory.lock"));
++        return new FileStream(Path.Combine(_root, "memory.lock"), FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
++    }
++    public JArray History(string quest) => new(Read()["attempts"]!.Where(a => a.Value<string>("quest") == quest)
++        .Select(a => a.DeepClone()));
++    public void BindRoster(string[] quests)
++    {
++        using var lease = Lease();
++        var data = Read();
++        if (quests.Length != 4 || quests.Distinct(StringComparer.Ordinal).Count() != 4)
++            throw new InvalidDataException("Four unique daily quests are required.");
++        if (data["quests"] is JArray previous && !previous.Values<string>().Order().SequenceEqual(quests.Order()))
++            throw new InvalidDataException("Persisted daily quest identities changed; review is required.");
++        data["quests"] = new JArray(quests); Write(data);
++    }
++    public int Used(string quest) => History(quest).Count;
++    public bool CanUseDefault(string quest)
++    {
++        var history = History(quest);
++        return history.Count == 0 || history.Count < 2 && history.Last!.Value<string>("version") != _version;
++    }
++    public string Reserve(string quest, string location, string strategy)
++    {
++        using var lease = Lease();
++        var data = Read(); var attempts = (JArray)data["attempts"]!;
++        if (data["quests"] is not JArray roster || !roster.Values<string>().Contains(quest))
++            throw new InvalidDataException("Attempt does not belong to the verified daily roster.");
++        if (attempts.Count >= 8 || attempts.Count(a => a.Value<string>("quest") == quest) >= 2)
++            throw new InvalidOperationException("Commission daily attempt budget exhausted.");
++        var id = Guid.NewGuid().ToString("N");
++        attempts.Add(new JObject { ["id"] = id, ["quest"] = quest, ["location"] = location,
++            ["version"] = _version, ["run"] = _run, ["strategy"] = strategy,
++            ["status"] = "reserved", ["reserved_at"] = DateTimeOffset.UtcNow });
++        Write(data); return id;
++    }
++    public void Verify(string id, bool completed)
++    {
++        using var lease = Lease();
++        var data = Read();
++        var attempt = data["attempts"]!.Single(a => a.Value<string>("id") == id);
++        if (attempt.Value<string>("status") != "reserved")
++            throw new InvalidOperationException("Attempt already resolved.");
++        attempt["status"] = completed ? "completed" : "incomplete";
++        attempt["verified_at"] = DateTimeOffset.UtcNow;
++        Write(data);
++    }
++}
+diff --git a/BetterGenshinImpact/Service/Agent/AgentGoalProgress.cs b/BetterGenshinImpact/Service/Agent/AgentGoalProgress.cs
+new file mode 100644
+index 0000000..7a63388
+--- /dev/null
++++ b/BetterGenshinImpact/Service/Agent/AgentGoalProgress.cs
+@@ -0,0 +1,89 @@
++using System;
++using System.Collections.Generic;
++using System.Diagnostics;
++using System.Linq;
++using Newtonsoft.Json.Linq;
++
++namespace BetterGenshinImpact.Service.Agent;
++
++// Only a new journal observation resolves an attempt. Persisted reservations
++// survive process restarts and version changes; old completion is never reused.
++public sealed class AgentGoalProgress
++{
++    private readonly Dictionary<int, int> _failures = new();
++    private readonly Dictionary<int, JObject> _rows = new();
++    private readonly AgentGoalMemory? _memory;
++    private string? _reservation;
++    private int? _pending;
++    private int? _localRecovery;
++    private string? _quest;
++    private string _phase = "idle";
++    private int _revision;
++    private readonly Stopwatch _phaseClock = Stopwatch.StartNew();
++    private JObject? _last;
++    public AgentGoalProgress(AgentGoalMemory? memory = null) { _memory = memory; }
++    public void BindScope(JObject scope) => _memory?.Bind(scope);
++    public void BindRows(JArray rows)
++    {
++        _memory?.BindRoster(rows.Select(r => r.Value<string>("name")!).ToArray());
++        _rows.Clear();
++        foreach (var row in rows.Cast<JObject>()) _rows.Add(row.Value<int>("id"), (JObject)row.DeepClone());
++    }
++    private string Name(int slot) => _rows.TryGetValue(slot, out var row) ? row.Value<string>("name")! : "";
++    public bool Available(int slot) => _memory == null ? _failures.GetValueOrDefault(slot) < 2
++        : _rows.ContainsKey(slot) && _memory.Used(Name(slot)) < 2 && _memory.CanUseDefault(Name(slot));
++    public bool CanRetry(int slot) => _memory != null && _rows.ContainsKey(slot)
++        && _memory.Used(Name(slot)) == 1 && _memory.History(Name(slot)).Last!.Value<string>("status") != "completed";
++    public bool LocalRecovery(int slot) => CanRetry(slot) && _localRecovery == slot
++        && !Name(slot).Contains("极速前进", StringComparison.Ordinal);
++    public bool TimedRoute => _quest?.Contains("极速前进", StringComparison.Ordinal) == true;
++    public void Begin(int slot, string name, string strategy = "default")
++    {
++        if (strategy is not ("default" or "ranged" or "reposition_left" or "reposition_right" or "heal_retry"))
++            throw new ArgumentException("Unknown bounded retry strategy.");
++        var available = strategy == "default" ? Available(slot)
++            : strategy == "heal_retry" ? CanRetry(slot) : LocalRecovery(slot);
++        if (slot is < 1 or > 4 || _pending != null || !available || _memory != null && name != Name(slot))
++            throw new InvalidOperationException("Commission requires verification or has exhausted its daily attempts.");
++        _reservation = _memory?.Reserve(name, _rows[slot].Value<string>("location") ?? "", strategy);
++        _pending = slot; _localRecovery = null;
++        _quest = $"{slot}:{name}";
++        Phase("prepare");
++    }
++    public void Phase(string phase)
++    {
++        if (phase is not ("prepare" or "route" or "interact" or "recover" or "verify" or "idle"))
++            throw new ArgumentException("Unknown commission phase.");
++        _phase = phase;
++        _revision++; _phaseClock.Restart();
++    }
++    public void Verify(bool completed)
++    {
++        if (_pending is not int slot) return;
++        if (_reservation != null) _memory!.Verify(_reservation, completed);
++        if (!completed) _failures[slot] = _failures.GetValueOrDefault(slot) + 1;
++        _last = new JObject { ["quest_id"] = _quest, ["completed"] = completed,
++            ["failed_attempts"] = Failures(slot), ["deferred"] = !Available(slot) && !CanRetry(slot) };
++        _localRecovery = completed ? null : slot;
++        _pending = null; _reservation = null; _quest = null;
++        Phase("idle");
++    }
++    private int Failures(int slot) => _memory == null ? _failures.GetValueOrDefault(slot)
++        : _memory.History(Name(slot)).Count(a => a.Value<string>("status") != "completed"
++            && (a.Value<string>("status") != "reserved" || a.Value<string>("id") != _reservation));
++    public JObject Snapshot()
++    {
++        var history = new JObject(); var failures = JObject.FromObject(_failures);
++        if (_memory != null)
++            foreach (var slot in _rows.Keys)
++            { history[slot.ToString()] = _memory.History(Name(slot)); failures[slot.ToString()] = Failures(slot); }
++        return new JObject
++        {
++        ["active_quest_id"] = _quest, ["phase"] = _phase, ["phase_revision"] = _revision,
++        ["phase_elapsed_seconds"] = Math.Round(_phaseClock.Elapsed.TotalSeconds, 1),
++        ["failed_attempts_by_slot"] = failures, ["attempt_history_by_slot"] = history,
++        ["last_verification"] = _last?.DeepClone(), ["attempt_limit_per_quest"] = 2,
++        ["failure_budget_scope"] = _memory == null ? "execution_session" : "account_server_game_day_quest_across_versions"
++        };
++    }
++}
+diff --git a/BetterGenshinImpact/Service/Agent/AgentJournalRows.cs b/BetterGenshinImpact/Service/Agent/AgentJournalRows.cs
+new file mode 100644
+index 0000000..8d2f6ec
+--- /dev/null
++++ b/BetterGenshinImpact/Service/Agent/AgentJournalRows.cs
+@@ -0,0 +1,43 @@
++using System;
++using System.Collections.Generic;
++using System.IO;
++using System.Linq;
++using Newtonsoft.Json.Linq;
++
++namespace BetterGenshinImpact.Service.Agent;
++
++/// <summary>Bind changing handbook positions to stable commission identities.</summary>
++internal static class AgentJournalRows
++{
++    internal static (JArray Rows, Dictionary<int, JObject> Evidence) Bind(
++        JArray previous, JArray observed, IReadOnlyDictionary<int, JObject> observations)
++    {
++        if (observed.Count != 4
++            || !observed.Select(r => r.Value<int>("id")).Order().SequenceEqual(new[] { 1, 2, 3, 4 })
++            || observed.Any(r => string.IsNullOrWhiteSpace(r.Value<string>("name")))
++            || observed.Select(r => r.Value<string>("name")).Distinct(StringComparer.Ordinal).Count() != 4)
++            throw new InvalidDataException("All four unique journal identities must be recognized.");
++
++        var identities = (previous.Count == 0 ? observed : previous)
++            .ToDictionary(r => r.Value<string>("name")!, r => r.Value<int>("id"), StringComparer.Ordinal);
++        if (identities.Count != 4 || observed.Any(r => !identities.ContainsKey(r.Value<string>("name")!)))
++            throw new InvalidDataException("Journal identities changed; manual review is required.");
++
++        var rows = new List<JObject>();
++        var evidence = new Dictionary<int, JObject>();
++        foreach (var observedRow in observed)
++        {
++            var visibleSlot = observedRow.Value<int>("id");
++            if (!observations.TryGetValue(visibleSlot, out var observation))
++                throw new InvalidDataException("Each journal row requires an unambiguous visual status.");
++            var row = (JObject)observedRow.DeepClone();
++            var stableSlot = identities[row.Value<string>("name")!];
++            row["id"] = stableSlot;
++            var proof = (JObject)observation.DeepClone();
++            proof["quest_id"] = $"{stableSlot}:{row["name"]}";
++            rows.Add(row);
++            evidence.Add(stableSlot, proof);
++        }
++        return (new JArray(rows.OrderBy(r => r.Value<int>("id"))), evidence);
++    }
++}
+diff --git a/BetterGenshinImpact/Service/Agent/AgentProgressSamples.cs b/BetterGenshinImpact/Service/Agent/AgentProgressSamples.cs
+new file mode 100644
+index 0000000..2f579cc
+--- /dev/null
++++ b/BetterGenshinImpact/Service/Agent/AgentProgressSamples.cs
+@@ -0,0 +1,39 @@
++using System;
++using System.Linq;
++using Newtonsoft.Json.Linq;
++
++namespace BetterGenshinImpact.Service.Agent;
++
++// Fixed-interval visual motion is a cue for Decision, never proof of kills or
++// completion. Enemy health and target distance remain unknown without detectors.
++public sealed class AgentProgressSamples
++{
++    private string? _phase;
++    private byte[]? _previous;
++    private long _at;
++    private int _samples;
++    private double _similarSeconds;
++    private double? _difference;
++    public JObject Observe(string phase, long milliseconds, byte[] grayscale)
++    {
++        if (grayscale.Length != 32 * 18) throw new ArgumentException("Expected a fixed-size world crop.");
++        if (_phase != phase)
++        { _phase = phase; _previous = null; _samples = 0; _similarSeconds = 0; _difference = null; }
++        if (_previous == null || milliseconds - _at >= 5000)
++        {
++            if (_previous != null)
++            {
++                _difference = grayscale.Zip(_previous, (a, b) => Math.Abs((int)a - b)).Average() / 255.0;
++                // A capture gap cannot be evidence of continuous inactivity.
++                _similarSeconds = milliseconds - _at <= 15000 && _difference < 0.02
++                    ? _similarSeconds + (milliseconds - _at) / 1000.0 : 0;
++            }
++            _previous = (byte[])grayscale.Clone(); _at = milliseconds; _samples++;
++        }
++        return new JObject { ["world_motion_difference"] = _difference,
++            ["similar_world_seconds"] = _similarSeconds, ["sample_count"] = _samples,
++            ["sample_age_seconds"] = Math.Max(0, milliseconds - _at) / 1000.0,
++            ["enemy_hp_fraction"] = null, ["target_distance"] = null,
++            ["interpretation"] = "visual_motion_cue_only_not_completion_or_damage" };
++    }
++}
+diff --git a/BetterGenshinImpact/Service/Agent/AgentRecoveryActions.cs b/BetterGenshinImpact/Service/Agent/AgentRecoveryActions.cs
+new file mode 100644
+index 0000000..910a400
+--- /dev/null
++++ b/BetterGenshinImpact/Service/Agent/AgentRecoveryActions.cs
+@@ -0,0 +1,363 @@
++using Newtonsoft.Json.Linq;
++namespace BetterGenshinImpact.Service.Agent;
++// Mirrored by the frozen Python recovery_actions catalog; parity is regression tested.
++internal static class AgentRecoveryActions
++{
++    internal const string Json = """
++[
++  {
++    "id": "recover.1.ranged",
++    "label": "委托1改变策略重试：在当前委托位置切夜兰，最多15秒普通远程攻击高处目标；占用今天最后一次尝试，结束后核验日志",
++    "skill": "daily.recover",
++    "skill_version": "1",
++    "arguments": {
++      "slot": 1,
++      "mode": "ranged"
++    },
++    "preconditions": {
++      "account_verified": true,
++      "foreground": true,
++      "region": "Mondstadt",
++      "scene": "world",
++      "daily_recovery_v1": true,
++      "daily_recovery_grounded": true,
++      "daily_needs_scan": false,
++      "daily_slot_1_local_recovery": true
++    },
++    "timeout_ms": 45000,
++    "ttl_ms": 15000
++  },
++  {
++    "id": "recover.1.reposition_left",
++    "label": "委托1改变策略重试：向左侧移动350毫秒避开柱子，然后夜兰普通远程攻击最多15秒；占用今天最后一次尝试，结束后核验日志",
++    "skill": "daily.recover",
++    "skill_version": "1",
++    "arguments": {
++      "slot": 1,
++      "mode": "reposition_left"
++    },
++    "preconditions": {
++      "account_verified": true,
++      "foreground": true,
++      "region": "Mondstadt",
++      "scene": "world",
++      "daily_recovery_v1": true,
++      "daily_recovery_grounded": true,
++      "daily_needs_scan": false,
++      "daily_slot_1_local_recovery": true
++    },
++    "timeout_ms": 45000,
++    "ttl_ms": 15000
++  },
++  {
++    "id": "recover.1.reposition_right",
++    "label": "委托1改变策略重试：向右侧移动350毫秒避开柱子，然后夜兰普通远程攻击最多15秒；占用今天最后一次尝试，结束后核验日志",
++    "skill": "daily.recover",
++    "skill_version": "1",
++    "arguments": {
++      "slot": 1,
++      "mode": "reposition_right"
++    },
++    "preconditions": {
++      "account_verified": true,
++      "foreground": true,
++      "region": "Mondstadt",
++      "scene": "world",
++      "daily_recovery_v1": true,
++      "daily_recovery_grounded": true,
++      "daily_needs_scan": false,
++      "daily_slot_1_local_recovery": true
++    },
++    "timeout_ms": 45000,
++    "ttl_ms": 15000
++  },
++  {
++    "id": "recover.1.heal_retry",
++    "label": "委托1改变策略重试：到七天神像恢复生命后重新执行该委托路线；占用今天最后一次尝试，结束后核验日志",
++    "skill": "daily.recover",
++    "skill_version": "1",
++    "arguments": {
++      "slot": 1,
++      "mode": "heal_retry"
++    },
++    "preconditions": {
++      "account_verified": true,
++      "foreground": true,
++      "region": "Mondstadt",
++      "scene": "world",
++      "daily_recovery_v1": true,
++      "daily_recovery_grounded": true,
++      "daily_needs_scan": false,
++      "daily_slot_1_retry": true
++    },
++    "timeout_ms": 300000,
++    "ttl_ms": 15000
++  },
++  {
++    "id": "recover.2.ranged",
++    "label": "委托2改变策略重试：在当前委托位置切夜兰，最多15秒普通远程攻击高处目标；占用今天最后一次尝试，结束后核验日志",
++    "skill": "daily.recover",
++    "skill_version": "1",
++    "arguments": {
++      "slot": 2,
++      "mode": "ranged"
++    },
++    "preconditions": {
++      "account_verified": true,
++      "foreground": true,
++      "region": "Mondstadt",
++      "scene": "world",
++      "daily_recovery_v1": true,
++      "daily_recovery_grounded": true,
++      "daily_needs_scan": false,
++      "daily_slot_2_local_recovery": true
++    },
++    "timeout_ms": 45000,
++    "ttl_ms": 15000
++  },
++  {
++    "id": "recover.2.reposition_left",
++    "label": "委托2改变策略重试：向左侧移动350毫秒避开柱子，然后夜兰普通远程攻击最多15秒；占用今天最后一次尝试，结束后核验日志",
++    "skill": "daily.recover",
++    "skill_version": "1",
++    "arguments": {
++      "slot": 2,
++      "mode": "reposition_left"
++    },
++    "preconditions": {
++      "account_verified": true,
++      "foreground": true,
++      "region": "Mondstadt",
++      "scene": "world",
++      "daily_recovery_v1": true,
++      "daily_recovery_grounded": true,
++      "daily_needs_scan": false,
++      "daily_slot_2_local_recovery": true
++    },
++    "timeout_ms": 45000,
++    "ttl_ms": 15000
++  },
++  {
++    "id": "recover.2.reposition_right",
++    "label": "委托2改变策略重试：向右侧移动350毫秒避开柱子，然后夜兰普通远程攻击最多15秒；占用今天最后一次尝试，结束后核验日志",
++    "skill": "daily.recover",
++    "skill_version": "1",
++    "arguments": {
++      "slot": 2,
++      "mode": "reposition_right"
++    },
++    "preconditions": {
++      "account_verified": true,
++      "foreground": true,
++      "region": "Mondstadt",
++      "scene": "world",
++      "daily_recovery_v1": true,
++      "daily_recovery_grounded": true,
++      "daily_needs_scan": false,
++      "daily_slot_2_local_recovery": true
++    },
++    "timeout_ms": 45000,
++    "ttl_ms": 15000
++  },
++  {
++    "id": "recover.2.heal_retry",
++    "label": "委托2改变策略重试：到七天神像恢复生命后重新执行该委托路线；占用今天最后一次尝试，结束后核验日志",
++    "skill": "daily.recover",
++    "skill_version": "1",
++    "arguments": {
++      "slot": 2,
++      "mode": "heal_retry"
++    },
++    "preconditions": {
++      "account_verified": true,
++      "foreground": true,
++      "region": "Mondstadt",
++      "scene": "world",
++      "daily_recovery_v1": true,
++      "daily_recovery_grounded": true,
++      "daily_needs_scan": false,
++      "daily_slot_2_retry": true
++    },
++    "timeout_ms": 300000,
++    "ttl_ms": 15000
++  },
++  {
++    "id": "recover.3.ranged",
++    "label": "委托3改变策略重试：在当前委托位置切夜兰，最多15秒普通远程攻击高处目标；占用今天最后一次尝试，结束后核验日志",
++    "skill": "daily.recover",
++    "skill_version": "1",
++    "arguments": {
++      "slot": 3,
++      "mode": "ranged"
++    },
++    "preconditions": {
++      "account_verified": true,
++      "foreground": true,
++      "region": "Mondstadt",
++      "scene": "world",
++      "daily_recovery_v1": true,
++      "daily_recovery_grounded": true,
++      "daily_needs_scan": false,
++      "daily_slot_3_local_recovery": true
++    },
++    "timeout_ms": 45000,
++    "ttl_ms": 15000
++  },
++  {
++    "id": "recover.3.reposition_left",
++    "label": "委托3改变策略重试：向左侧移动350毫秒避开柱子，然后夜兰普通远程攻击最多15秒；占用今天最后一次尝试，结束后核验日志",
++    "skill": "daily.recover",
++    "skill_version": "1",
++    "arguments": {
++      "slot": 3,
++      "mode": "reposition_left"
++    },
++    "preconditions": {
++      "account_verified": true,
++      "foreground": true,
++      "region": "Mondstadt",
++      "scene": "world",
++      "daily_recovery_v1": true,
++      "daily_recovery_grounded": true,
++      "daily_needs_scan": false,
++      "daily_slot_3_local_recovery": true
++    },
++    "timeout_ms": 45000,
++    "ttl_ms": 15000
++  },
++  {
++    "id": "recover.3.reposition_right",
++    "label": "委托3改变策略重试：向右侧移动350毫秒避开柱子，然后夜兰普通远程攻击最多15秒；占用今天最后一次尝试，结束后核验日志",
++    "skill": "daily.recover",
++    "skill_version": "1",
++    "arguments": {
++      "slot": 3,
++      "mode": "reposition_right"
++    },
++    "preconditions": {
++      "account_verified": true,
++      "foreground": true,
++      "region": "Mondstadt",
++      "scene": "world",
++      "daily_recovery_v1": true,
++      "daily_recovery_grounded": true,
++      "daily_needs_scan": false,
++      "daily_slot_3_local_recovery": true
++    },
++    "timeout_ms": 45000,
++    "ttl_ms": 15000
++  },
++  {
++    "id": "recover.3.heal_retry",
++    "label": "委托3改变策略重试：到七天神像恢复生命后重新执行该委托路线；占用今天最后一次尝试，结束后核验日志",
++    "skill": "daily.recover",
++    "skill_version": "1",
++    "arguments": {
++      "slot": 3,
++      "mode": "heal_retry"
++    },
++    "preconditions": {
++      "account_verified": true,
++      "foreground": true,
++      "region": "Mondstadt",
++      "scene": "world",
++      "daily_recovery_v1": true,
++      "daily_recovery_grounded": true,
++      "daily_needs_scan": false,
++      "daily_slot_3_retry": true
++    },
++    "timeout_ms": 300000,
++    "ttl_ms": 15000
++  },
++  {
++    "id": "recover.4.ranged",
++    "label": "委托4改变策略重试：在当前委托位置切夜兰，最多15秒普通远程攻击高处目标；占用今天最后一次尝试，结束后核验日志",
++    "skill": "daily.recover",
++    "skill_version": "1",
++    "arguments": {
++      "slot": 4,
++      "mode": "ranged"
++    },
++    "preconditions": {
++      "account_verified": true,
++      "foreground": true,
++      "region": "Mondstadt",
++      "scene": "world",
++      "daily_recovery_v1": true,
++      "daily_recovery_grounded": true,
++      "daily_needs_scan": false,
++      "daily_slot_4_local_recovery": true
++    },
++    "timeout_ms": 45000,
++    "ttl_ms": 15000
++  },
++  {
++    "id": "recover.4.reposition_left",
++    "label": "委托4改变策略重试：向左侧移动350毫秒避开柱子，然后夜兰普通远程攻击最多15秒；占用今天最后一次尝试，结束后核验日志",
++    "skill": "daily.recover",
++    "skill_version": "1",
++    "arguments": {
++      "slot": 4,
++      "mode": "reposition_left"
++    },
++    "preconditions": {
++      "account_verified": true,
++      "foreground": true,
++      "region": "Mondstadt",
++      "scene": "world",
++      "daily_recovery_v1": true,
++      "daily_recovery_grounded": true,
++      "daily_needs_scan": false,
++      "daily_slot_4_local_recovery": true
++    },
++    "timeout_ms": 45000,
++    "ttl_ms": 15000
++  },
++  {
++    "id": "recover.4.reposition_right",
++    "label": "委托4改变策略重试：向右侧移动350毫秒避开柱子，然后夜兰普通远程攻击最多15秒；占用今天最后一次尝试，结束后核验日志",
++    "skill": "daily.recover",
++    "skill_version": "1",
++    "arguments": {
++      "slot": 4,
++      "mode": "reposition_right"
++    },
++    "preconditions": {
++      "account_verified": true,
++      "foreground": true,
++      "region": "Mondstadt",
++      "scene": "world",
++      "daily_recovery_v1": true,
++      "daily_recovery_grounded": true,
++      "daily_needs_scan": false,
++      "daily_slot_4_local_recovery": true
++    },
++    "timeout_ms": 45000,
++    "ttl_ms": 15000
++  },
++  {
++    "id": "recover.4.heal_retry",
++    "label": "委托4改变策略重试：到七天神像恢复生命后重新执行该委托路线；占用今天最后一次尝试，结束后核验日志",
++    "skill": "daily.recover",
++    "skill_version": "1",
++    "arguments": {
++      "slot": 4,
++      "mode": "heal_retry"
++    },
++    "preconditions": {
++      "account_verified": true,
++      "foreground": true,
++      "region": "Mondstadt",
++      "scene": "world",
++      "daily_recovery_v1": true,
++      "daily_recovery_grounded": true,
++      "daily_needs_scan": false,
++      "daily_slot_4_retry": true
++    },
++    "timeout_ms": 300000,
++    "ttl_ms": 15000
++  }
++]
++""";
++    internal static JArray Catalog() => JArray.Parse(Json);
++}
+diff --git a/BetterGenshinImpact/Service/Agent/AgentRecoveryUi.cs b/BetterGenshinImpact/Service/Agent/AgentRecoveryUi.cs
+new file mode 100644
+index 0000000..6bf8be3
+--- /dev/null
++++ b/BetterGenshinImpact/Service/Agent/AgentRecoveryUi.cs
+@@ -0,0 +1,18 @@
++using System;
++using System.Text.RegularExpressions;
++
++namespace BetterGenshinImpact.Service.Agent;
++
++internal static class AgentRecoveryUi
++{
++    // The observed free respawn screen, not a food-selection revive dialog.
++    internal static bool IsColdDefeat(string text)
++    {
++        var compact = Regex.Replace(text, @"\s+", "");
++        return compact.Contains("复苏", StringComparison.Ordinal)
++            && compact.Contains("严寒", StringComparison.Ordinal)
++            && (compact.Contains("寒冷环境", StringComparison.Ordinal)
++                || (compact.Contains("积累至上限", StringComparison.Ordinal)
++                    && compact.Contains("削减角色生命值", StringComparison.Ordinal)));
++    }
++}
+diff --git a/BetterGenshinImpact/Service/Agent/AgentResinBudget.cs b/BetterGenshinImpact/Service/Agent/AgentResinBudget.cs
+new file mode 100644
+index 0000000..9b117e6
+--- /dev/null
++++ b/BetterGenshinImpact/Service/Agent/AgentResinBudget.cs
+@@ -0,0 +1,173 @@
++using System;
++using System.IO;
++using System.Linq;
++using System.Security.Cryptography;
++using System.Text;
++using System.Text.RegularExpressions;
++using Newtonsoft.Json;
++using Newtonsoft.Json.Linq;
++
++namespace BetterGenshinImpact.Service.Agent;
++
++// Trusted spending boundary, not editable by the RSI candidate. A crash or
++// ambiguous claim blocks further spending across restarts and target changes.
++public sealed class AgentResinBudget
++{
++    private readonly string _root;
++    private string? _path;
++    private JObject? _scope;
++    private readonly string? _version;
++    private readonly bool _developerRetry;
++    public JObject Plan { get; }
++    public AgentResinBudget(string root, JObject plan, string? version = null, bool developerRetry = false)
++    {
++        _version = version; _developerRetry = developerRetry;
++        Plan = (JObject)plan.DeepClone(); _root = Path.GetFullPath(root);
++        if (plan.Count != 6 || plan.Value<bool?>("enabled") != true
++            || plan.Value<string>("resource") != "original_only"
++            || !Regex.IsMatch(plan.Value<string>("domain") ?? "", @"^[\u4e00-\u9fff·]{1,64}$")
++            || !Regex.IsMatch(plan.Value<string>("stage") ?? "", @"^[\u4e00-\u9fffA-Za-z0-9Ⅰ-Ⅻ·]{1,64}$")
++            || plan["recommended_level"]?.Type != JTokenType.Integer || plan.Value<int>("recommended_level") is < 1 or > 100
++            || plan["daily_budget"]?.Type != JTokenType.Integer || plan.Value<int>("daily_budget") is < 20 or > 200
++            || plan.Value<int>("daily_budget") % 20 != 0)
++            throw new InvalidDataException("Invalid original-resin plan.");
++        Directory.CreateDirectory(_root); RejectLink(_root);
++    }
++    private static void RejectLink(string path)
++    {
++        if ((File.Exists(path) || Directory.Exists(path)) && (File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0)
++            throw new InvalidDataException("Resin evidence cannot contain links.");
++    }
++    public void Bind(JObject scope)
++    {
++        if (_scope != null && !JToken.DeepEquals(_scope, scope)) throw new InvalidDataException("Resin scope changed.");
++        if (new[] { "account_id", "server_id", "game_day" }.Any(k => scope[k]?.Type != JTokenType.String))
++            throw new InvalidDataException("Incomplete resin scope.");
++        _scope = (JObject)scope.DeepClone();
++        _path = Path.Combine(_root, Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(scope.ToString(Formatting.None)))) + ".json");
++        Read();
++    }
++    private JObject Read()
++    {
++        if (_path == null) throw new InvalidOperationException("Resin scope not bound.");
++        RejectLink(_path);
++        if (!File.Exists(_path)) return new JObject { ["scope"] = _scope!.DeepClone(), ["attempts"] = new JArray() };
++        if (new FileInfo(_path).Length > 1024 * 1024) throw new InvalidDataException("Resin ledger too large.");
++        var data = JObject.Parse(File.ReadAllText(_path));
++        if (!JToken.DeepEquals(data["scope"], _scope) || data["attempts"] is not JArray rows || rows.Count > 20
++            || rows.Any(r => r.Value<int>("cost") is not (20 or 40)
++                || r.Value<string>("status") is not ("reserved" or "verified" or "failed" or "unknown")
++                || string.IsNullOrWhiteSpace(r.Value<string>("id")))
++            || rows.Select(r => r.Value<string>("id")).Distinct().Count() != rows.Count)
++            throw new InvalidDataException("Invalid resin ledger; preserve for review.");
++        return data;
++    }
++    private void Write(JObject data)
++    {
++        var temp = _path + "." + Guid.NewGuid().ToString("N") + ".tmp";
++        using (var file = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
++        { file.Write(Encoding.UTF8.GetBytes(data.ToString(Formatting.Indented))); file.Flush(true); }
++        File.Move(temp, _path!, true);
++    }
++    private FileStream Lease()
++    {
++        var path = Path.Combine(_root, "budget.lock"); RejectLink(path);
++        return new FileStream(path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
++    }
++    public JArray Rows => (JArray)Read()["attempts"]!;
++    public int Spent => Rows.Where(r => r.Value<string>("status") == "verified").Sum(r => r.Value<int>("cost"));
++    private JObject? RetryGrant(JArray rows)
++    {
++        // Explicit human-requested development continuation, never an autonomous
++        // budget reset. All original failures and the shared spending cap remain.
++        if (!_developerRetry || _version == null || _path == null) return null;
++        var path = _path + ".retry.json"; RejectLink(path);
++        if (!File.Exists(path)) return null;
++        if (new FileInfo(path).Length > 16384) throw new InvalidDataException("Retry grant too large.");
++        var grant = JObject.Parse(File.ReadAllText(path));
++        var failed = rows.Where(r => r.Value<string>("status") == "failed").Select(r => r.Value<string>("id")!).OrderBy(x => x).ToArray();
++        if (grant.Value<string>("origin") != "explicit_operator_development_retry"
++            || grant.Value<string>("version") != _version || !JToken.DeepEquals(grant["scope"], _scope)
++            || !JToken.DeepEquals(grant["plan"], Plan)
++            || !Regex.IsMatch(grant.Value<string>("id") ?? "", "^[a-f0-9]{32}$")
++            || grant["max_rounds"]?.Type != JTokenType.Integer || grant.Value<int>("max_rounds") is < 1 or > 10
++            || grant["failed_attempt_ids"] is not JArray approved || approved.Any(x => x.Type != JTokenType.String)
++            || !approved.Values<string>().OrderBy(x => x).SequenceEqual(failed)
++            || !DateTimeOffset.TryParse(grant.Value<string>("expires_at"), out var expires) || expires <= DateTimeOffset.UtcNow
++            || rows.Any(r => r.Value<string>("status") is "reserved" or "unknown")
++            || rows.Count(r => r.Value<string>("developer_retry_grant") == grant.Value<string>("id")) >= grant.Value<int>("max_rounds"))
++            return null;
++        return grant;
++    }
++    public bool Blocked { get { var rows = Rows; return rows.Any(r => r.Value<string>("status") is "reserved" or "unknown")
++        // Exhausting a development retry after the last verified claim is not an
++        // incomplete goal. The spending cap still makes NextCost zero. Unknown
++        // claims keep blocking even when the verified cap has been reached.
++        || Spent < Plan.Value<int>("daily_budget")
++            && rows.Count(r => r.Value<string>("status") == "failed") >= 2 && RetryGrant(rows) == null; } }
++    public int NextCost(int balance)
++    {
++        if (Blocked || balance is < 0 or > 200) return 0;
++        var remaining = Math.Min(balance, Plan.Value<int>("daily_budget") - Spent);
++        return remaining >= 40 ? 40 : remaining >= 20 ? 20 : 0;
++    }
++    public string Reserve(int balance, string run, string version)
++    {
++        using var lease = Lease();
++        var cost = NextCost(balance);
++        if (cost == 0) throw new InvalidOperationException("Resin budget unavailable.");
++        var data = Read(); var rows = (JArray)data["attempts"]!;
++        var grant = rows.Count(r => r.Value<string>("status") == "failed") >= 2 ? RetryGrant(rows) : null;
++        if (grant != null && version != _version) throw new InvalidDataException("Retry version changed.");
++        var id = Guid.NewGuid().ToString("N");
++        rows.Add(new JObject { ["id"] = id, ["run"] = run, ["version"] = version,
++            ["domain"] = Plan["domain"], ["stage"] = Plan["stage"], ["recommended_level"] = Plan["recommended_level"],
++            ["scope"] = _scope!.DeepClone(), ["before"] = balance, ["cost"] = cost,
++            ["status"] = "reserved", ["at"] = DateTimeOffset.UtcNow,
++            ["developer_retry_grant"] = grant?["id"]?.DeepClone() });
++        Write(data); return id;
++    }
++    public void Finish(string id, string status, JObject evidence)
++    {
++        using var lease = Lease(); var data = Read();
++        var row = data["attempts"]!.Single(r => r.Value<string>("id") == id);
++        if (row.Value<string>("status") != "reserved" || status is not ("verified" or "failed" or "unknown"))
++            throw new InvalidOperationException("Resin attempt cannot be overwritten.");
++        var claimBefore = evidence.Value<int?>("claim_before") ?? row.Value<int>("before");
++        if (status == "verified" && (evidence.Value<int?>("after") == null
++            || (evidence["claim_before"] != null && evidence["claim_before"]!.Type != JTokenType.Integer)
++            || claimBefore < row.Value<int>("before") || claimBefore > 200
++            || claimBefore - evidence.Value<int>("after") != row.Value<int>("cost")
++            || evidence["proofs"] is not JObject proofs
++            || new[] { "before", "selection", "claim", "reward", "after" }.Any(key =>
++                proofs[key]?.Type != JTokenType.String || string.IsNullOrWhiteSpace(proofs.Value<string>(key)))))
++            throw new InvalidDataException("Resin deduction and reward evidence required.");
++        ((JObject)row).Merge(evidence); row["status"] = status; Write(data);
++    }
++    public static int ReadCost(string text)
++    {
++        if (!text.Contains("原粹树脂", StringComparison.Ordinal)) return 0;
++        var matches = Regex.Matches(text, @"(?<!\d)(20|40)(?!\d)");
++        return matches.Count == 1 ? int.Parse(matches[0].Value) : 0;
++    }
++    public static int? ReadBalanceText(string text)
++    {
++        var matches = Regex.Matches(text, @"(?<!\d)(\d{1,3})\s*/\s*200(?!\d)");
++        if (matches.Count != 1) return null;
++        var value = int.Parse(matches[0].Groups[1].Value);
++        return value <= 200 ? value : null;
++    }
++    public static bool StageMatches(string observed, string expected)
++    {
++        static string Normalize(string text) => Regex.Replace(text.Normalize(NormalizationForm.FormKC), @"[\s:：]", "");
++        var actual = Normalize(observed); var stage = Normalize(expected);
++        return actual == stage || new[] { "祝圣秘境", "炼武秘境", "精通秘境" }.Any(prefix => actual == prefix + stage);
++    }
++    public static bool SelectedStageMatches(string observed, string expected)
++    {
++        // OCR may also see the adjacent information icon as a separate Greek glyph.
++        // Match one complete title line, never a substring that confuses V with IV/VI.
++        var lines = observed.Split('\n', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
++        return lines.Count(line => StageMatches(line, expected)) == 1;
++    }
++}
+diff --git a/BetterGenshinImpact/Service/Agent/AgentResinSession.cs b/BetterGenshinImpact/Service/Agent/AgentResinSession.cs
+new file mode 100644
+index 0000000..f539326
+--- /dev/null
++++ b/BetterGenshinImpact/Service/Agent/AgentResinSession.cs
+@@ -0,0 +1,216 @@
++using System;
++using System.Collections.Generic;
++using System.IO;
++using System.Linq;
++using System.Security.Cryptography;
++using System.Text.RegularExpressions;
++using System.Threading;
++using System.Threading.Tasks;
++using BetterGenshinImpact.Core.Config;
++using BetterGenshinImpact.Core.Input;
++using BetterGenshinImpact.Core.Recognition;
++using BetterGenshinImpact.Core.Recognition.OCR;
++using BetterGenshinImpact.GameTask;
++using BetterGenshinImpact.GameTask.AutoDomain;
++using BetterGenshinImpact.GameTask.AutoTrackPath;
++using BetterGenshinImpact.GameTask.Common;
++using BetterGenshinImpact.GameTask.Common.BgiVision;
++using BetterGenshinImpact.GameTask.Common.Job;
++using BetterGenshinImpact.GameTask.Common.Element.Assets;
++using BetterGenshinImpact.GameTask.Model.Area;
++using Newtonsoft.Json.Linq;
++using OpenCvSharp;
++
++namespace BetterGenshinImpact.Service.Agent;
++
++public sealed class AgentResinSession
++{
++    private readonly AgentResinBudget _budget;
++    private readonly string _run;
++    private readonly string _version;
++    private int? _balance;
++    private JObject? _scope;
++    private string? _before;
++    private int _cost;
++    private int? _claimBalance;
++    private bool _claimClicked;
++    private bool _rewardSeen;
++    private string _phase = "preflight";
++    private JObject _proofs = new();
++    private readonly object _gate = new();
++    private JObject _facts = new() { ["resin_workload"] = true, ["resin_needs_scan"] = true, ["resin_can_run"] = false };
++    public AgentResinSession(string home, string run, string version, JObject plan, bool developerRetry = false)
++    {
++        _run = run; _version = version;
++        _budget = new AgentResinBudget(Path.Combine(home, "resin-budget"), plan, version, developerRetry);
++        if (!MapLazyAssets.Get().DomainPositionMap.ContainsKey(plan.Value<string>("domain")!))
++            throw new InvalidDataException("Domain is absent from pinned BetterGI map.");
++        Directory.CreateDirectory(Path.Combine(run, "resin-evidence"));
++        _facts["resin"] = new JObject { ["plan"] = _budget.Plan.DeepClone(), ["balance"] = null,
++            ["spent_today"] = null, ["done"] = false, ["blocked"] = false, ["receipts"] = new JArray() };
++    }
++    public JObject Snapshot() { lock (_gate) return (JObject)_facts.DeepClone(); }
++    private void Publish(bool needsScan = false)
++    {
++        lock (_gate) _facts = new JObject {
++            ["resin_workload"] = true, ["resin_needs_scan"] = needsScan,
++            ["resin_can_run"] = !needsScan && _balance != null && _budget.NextCost(_balance.Value) > 0,
++            ["resin"] = new JObject { ["plan"] = _budget.Plan.DeepClone(), ["balance"] = _balance,
++                ["spent_today"] = _budget.Spent, ["blocked"] = _budget.Blocked,
++                ["done"] = !needsScan && !_budget.Blocked && _balance != null && _budget.NextCost(_balance.Value) == 0,
++                ["receipts"] = new JArray(_budget.Rows.Where(r => r.Value<string>("run") == Path.GetFileName(_run)
++                    && r.Value<string>("status") == "verified")),
++                ["attempts"] = _budget.Rows } };
++    }
++    private string Save(ImageRegion frame)
++    {
++        Cv2.ImEncode(".png", frame.SrcMat, out var png);
++        var hash = Convert.ToHexString(SHA256.HashData(png)).ToLowerInvariant();
++        File.WriteAllBytes(Path.Combine(_run, "resin-evidence", hash + ".png"), png); return hash;
++    }
++    private async Task<(int Balance, string Proof)> ReadBalance(CancellationToken ct)
++    {
++        await new ReturnMainUiTask().Start(ct);
++        await new TpTask(ct).OpenBigMapUi();
++        int? previous = null;
++        for (var i = 0; i < 8; i++)
++        {
++            await Task.Delay(400, ct);
++            using var frame = TaskControl.CaptureToRectArea();
++            // The upstream thresholded crop truncates digits with some UI layouts.
++            // Require the map and a unique literal current/200 in its resin-only top bar.
++            using var top = frame.DeriveCrop(new Rect((int)(frame.Width * .62), 0,
++                (int)(frame.Width * .13), (int)(frame.Height * .08)));
++            var value = Bv.WhichGameUi(frame) == GameUiCategory.BigMap
++                ? AgentResinBudget.ReadBalanceText(OcrFactory.Paddle.Ocr(top.SrcMat)) : null;
++            if (value != null)
++            {
++                if (previous == value.Value)
++                {
++                    var result = (value.Value, Save(frame));
++                    await new ReturnMainUiTask().Start(ct); return result;
++                }
++                previous = value.Value;
++            }
++            else previous = null;
++        }
++        throw new InvalidDataException("Two stable original-resin readings required.");
++    }
++    public async Task Execute(string skill, JObject scope, CancellationToken ct)
++    {
++        _budget.Bind(scope); _scope = (JObject)scope.DeepClone();
++        if (skill == "resin.scan")
++        {
++            var reading = await ReadBalance(ct); _balance = reading.Balance; _before = reading.Proof;
++            Publish(); return;
++        }
++        if (skill != "resin.domain" || _balance == null) throw new InvalidOperationException("Scan resin first.");
++        // Read immediately before reservation; the model's previous frame is not a balance oracle.
++        var before = await ReadBalance(ct); _balance = before.Balance; _before = before.Proof;
++        _cost = _budget.NextCost(_balance.Value);
++        var id = _budget.Reserve(_balance.Value, Path.GetFileName(_run), _version);
++        _claimClicked = _rewardSeen = false; _claimBalance = null; _proofs = new JObject { ["before"] = _before };
++        Publish();
++        try
++        {
++            var path = Global.Absolute(@"User\AutoFight\StartLux\bennett-ayaka-yelan-zhongli.txt");
++            if (!File.Exists(path)) throw new FileNotFoundException("Frozen combat strategy missing.");
++            var param = new AutoDomainParam(1, path) {
++                DomainName = _budget.Plan.Value<string>("domain")!, PartyName = "", SundaySelectedValue = "",
++                AutoArtifactSalvage = false, SpecifyResinUse = true, ResinPriorityList = new List<string> { "原粹树脂" },
++                OriginalResinUseCount = 0, OriginalResin20UseCount = _cost == 20 ? 1 : 0,
++                OriginalResin40UseCount = _cost == 40 ? 1 : 0, CondensedResinUseCount = 0,
++                TransientResinUseCount = 0, FragileResinUseCount = 0, RewardRecognitionEnabled = false,
++                AgentResin = this };
++            _phase = "travel_or_entry";
++            await new AutoDomainTask(param).Start(ct);
++            if (!_claimClicked || !_rewardSeen) throw new InvalidDataException("Domain returned without a verified claim.");
++            _phase = "balance_verification";
++            var after = await ReadBalance(ct); _balance = after.Balance; _proofs["after"] = after.Proof;
++            _phase = "ledger_verification";
++            _budget.Finish(id, "verified", new JObject { ["after"] = _balance,
++                ["claim_before"] = _claimBalance, ["proofs"] = _proofs });
++        }
++        catch (Exception error)
++        {
++            _budget.Finish(id, _claimClicked ? "unknown" : "failed", new JObject {
++                ["proofs"] = _proofs, ["after"] = _proofs["after"] != null ? _balance : null,
++                ["claim_before"] = _claimBalance,
++                ["failure_phase"] = _phase, ["error_type"] = error.GetType().Name });
++            Publish(true); throw;
++        }
++        Publish();
++    }
++    // Map names and challenge names differ. Bind the row's title AND level,
++    // select that row, then require the right-hand title to confirm selection.
++    public async Task SelectAndVerify(CancellationToken ct)
++    {
++        _phase = "entry_selection";
++        using var frame = TaskControl.CaptureToRectArea();
++        var level = _budget.Plan.Value<int>("recommended_level");
++        var stage = _budget.Plan.Value<string>("stage")!;
++        _proofs["entry_menu"] = Save(frame);
++        var rows = frame.FindMulti(RecognitionObject.Ocr(0, frame.Height * .10, frame.Width * .48, frame.Height * .70));
++        var titles = rows.Where(r => AgentResinBudget.StageMatches(r.Text, stage)).ToArray();
++        if (titles.Length != 1 || !rows.Any(r => r.Y > titles[0].Y && r.Y < titles[0].Y + frame.Height * .08
++            && Regex.IsMatch(Regex.Replace(r.Text, @"\s+", ""), $@"推荐(?:队伍)?等级[:：]?{level}(?!\d)")))
++            throw new InvalidDataException("Configured domain/difficulty not visually verified; no challenge entered.");
++        ct.ThrowIfCancellationRequested(); titles[0].Click();
++        await Task.Delay(500, ct);
++        using var selected = TaskControl.CaptureToRectArea();
++        using var heading = selected.DeriveCrop(new Rect((int)(selected.Width * .63), (int)(selected.Height * .10),
++            (int)(selected.Width * .35), (int)(selected.Height * .08)));
++        if (!AgentResinBudget.SelectedStageMatches(OcrFactory.Paddle.Ocr(heading.SrcMat), stage)
++            || !OcrFactory.Paddle.Ocr(selected.SrcMat).Contains("单人挑战", StringComparison.Ordinal))
++            throw new InvalidDataException("Selected challenge title not confirmed.");
++        _proofs["selection"] = Save(selected);
++        _phase = "challenge";
++    }
++    public async Task<bool> Claim(CancellationToken ct)
++    {
++        _phase = "claim_validation";
++        InputHub.ReleaseAll();
++        for (var attempt = 0; attempt < 12; attempt++)
++        {
++            await Task.Delay(500, ct);
++            using var frame = TaskControl.CaptureToRectArea();
++            var rows = frame.FindMulti(RecognitionObject.Ocr(frame.Width * .25, frame.Height * .2, frame.Width * .5, frame.Height * .6));
++            var text = string.Join(" ", rows.Select(r => r.Text));
++            if (text.Contains("补充原粹树脂") || text.Contains("数量不足"))
++                throw new InvalidDataException("Original resin unavailable; refills are forbidden.");
++            var original = rows.Where(r => r.Text.Contains("原粹树脂", StringComparison.Ordinal)).ToArray();
++            if (original.Length != 1) continue;
++            var cost = AgentResinBudget.ReadCost(original[0].Text);
++            if (cost == 0) throw new InvalidDataException("Unambiguous original-resin cost is required before clicking.");
++            if (cost != _cost)
++            {
++                using var toggle = frame.Find(RecognitionAssets.Get("AutoDomain", "ResinSwitchBtn", frame.Width, frame.Height));
++                if (toggle.IsEmpty()) throw new InvalidDataException("Required original-resin amount unavailable.");
++                ct.ThrowIfCancellationRequested(); toggle.Click(); continue;
++            }
++            var buttons = rows.Where(r => r.Text.Trim() == "使用" && r.X > frame.Width / 2
++                && r.Y < original[0].Y + original[0].Height && original[0].Y < r.Y + r.Height).ToArray();
++            if (buttons.Length != 1) throw new InvalidDataException("Unique original-resin use button required.");
++            // Natural regeneration can occur during combat. Read the balance from
++            // this same original-resin claim frame, immediately before the click.
++            using var top = frame.DeriveCrop(new Rect((int)(frame.Width * .5), 0,
++                (int)(frame.Width * .45), (int)(frame.Height * .08)));
++            _claimBalance = AgentResinBudget.ReadBalanceText(OcrFactory.Paddle.Ocr(top.SrcMat));
++            if (_claimBalance == null || _claimBalance < _balance || _claimBalance < _cost)
++                throw new InvalidDataException("Fresh original-resin balance required before claiming.");
++            _proofs["claim"] = Save(frame);
++            ct.ThrowIfCancellationRequested(); _claimClicked = true; _phase = "reward_verification"; buttons[0].Click(); break;
++        }
++        if (!_claimClicked) throw new InvalidDataException("No verified original-resin claim dialog.");
++        for (var attempt = 0; attempt < 20; attempt++)
++        {
++            await Task.Delay(500, ct); using var frame = TaskControl.CaptureToRectArea();
++            using var exit = frame.Find(RecognitionAssets.Get("AutoFight", "Exit", frame));
++            using var repeat = frame.Find(RecognitionAssets.Get("AutoFight", "Confirm", frame));
++            if (exit.IsEmpty() || repeat.IsEmpty()) continue;
++            _proofs["reward"] = Save(frame); _rewardSeen = true;
++            ct.ThrowIfCancellationRequested(); exit.Click(); return false;
++        }
++        throw new InvalidDataException("Claim outcome unknown; spending blocked pending review.");
++    }
++}
+diff --git a/BetterGenshinImpact/Service/Agent/AgentScriptInput.cs b/BetterGenshinImpact/Service/Agent/AgentScriptInput.cs
+new file mode 100644
+index 0000000..2b2403a
+--- /dev/null
++++ b/BetterGenshinImpact/Service/Agent/AgentScriptInput.cs
+@@ -0,0 +1,46 @@
++using System;
++
++namespace BetterGenshinImpact.Service.Agent;
++
++/// <summary>Per-command interaction timing and dialogue-entry evidence.</summary>
++internal sealed class AgentScriptInput(
++    Action<string> press, Action<string> down, Action<string> up,
++    Action<int> wait, Func<bool> isDialogue, bool requireDialogue)
++{
++    private bool _interactionAttempted;
++    private bool _dialogueObserved;
++
++    internal void Press(string key)
++    {
++        ObserveDialogue();
++        if (!key.Equals("F", StringComparison.OrdinalIgnoreCase)
++            && !key.Equals("VK_F", StringComparison.OrdinalIgnoreCase))
++        {
++            press(key);
++            return;
++        }
++
++        _interactionAttempted = true;
++        // A down/up pair in one SendInput batch may be missed by a game frame.
++        // Always release even if cancellation arrives while the key is held.
++        down(key);
++        try { wait(100); }
++        finally { up(key); }
++        wait(400);
++        ObserveDialogue();
++    }
++
++    private void ObserveDialogue()
++    {
++        if (requireDialogue && !_dialogueObserved && isDialogue())
++            _dialogueObserved = true;
++    }
++
++    internal void VerifyDialogue()
++    {
++        ObserveDialogue();
++        if (requireDialogue && _interactionAttempted && !_dialogueObserved)
++            throw new InvalidOperationException(
++                "Talk commission attempted interaction but never entered a verified dialogue view.");
++    }
++}
+diff --git a/BetterGenshinImpact/Service/Agent/AgentTimedRoutePolicy.cs b/BetterGenshinImpact/Service/Agent/AgentTimedRoutePolicy.cs
+new file mode 100644
+index 0000000..4a032db
+--- /dev/null
++++ b/BetterGenshinImpact/Service/Agent/AgentTimedRoutePolicy.cs
+@@ -0,0 +1,37 @@
++using System;
++using System.Text.RegularExpressions;
++
++namespace BetterGenshinImpact.Service.Agent;
++
++/// <summary>Bounded model-selected behavior for Full Speed Ahead only.</summary>
++internal static class AgentTimedRoutePolicy
++{
++    internal static int Validate(int threshold) => threshold == 0
++        ? threshold : throw new ArgumentOutOfRangeException(nameof(threshold));
++
++    internal static int? RemainingSeconds(string text)
++    {
++        var compact = Regex.Replace(text, @"\s+", "");
++        // A clock or ability cooldown alone cannot enable the route override.
++        if (!(compact.Contains("击败魔物", StringComparison.Ordinal)
++                || compact.Contains("消灭魔物", StringComparison.Ordinal))
++            || !compact.Contains("时间", StringComparison.Ordinal)
++            || !compact.Contains("中断挑战", StringComparison.Ordinal))
++            return null;
++        var labelled = Regex.Match(compact, @"剩余时间[:：](\d{1,3})秒");
++        int? seconds = labelled.Success ? int.Parse(labelled.Groups[1].Value) : null;
++        var clock = Regex.Match(text, @"(?<!\d)([0-2]):([0-5]\d)(?!\d)");
++        // Also accept the observed 00:29 form, retaining exact timer syntax.
++        if (!clock.Success) clock = Regex.Match(text, @"(?<!\d)(0[0-2]):([0-5]\d)(?!\d)");
++        if (clock.Success)
++        {
++            var clockSeconds = int.Parse(clock.Groups[1].Value) * 60 + int.Parse(clock.Groups[2].Value);
++            if (seconds.HasValue && Math.Abs(seconds.Value - clockSeconds) > 1) return null;
++            seconds ??= clockSeconds;
++        }
++        return seconds is > 0 and <= 180 ? seconds : null;
++    }
++
++    internal static bool SkipFight(int threshold, int? seconds)
++        => Validate(threshold) > 0 && seconds is > 0 && seconds <= threshold;
++}
+diff --git a/BetterGenshinImpact/Service/Agent/AgentUidRecognition.cs b/BetterGenshinImpact/Service/Agent/AgentUidRecognition.cs
+new file mode 100644
+index 0000000..9154568
+--- /dev/null
++++ b/BetterGenshinImpact/Service/Agent/AgentUidRecognition.cs
+@@ -0,0 +1,24 @@
++using System;
++using System.Linq;
++using System.Text.RegularExpressions;
++
++namespace BetterGenshinImpact.Service.Agent;
++
++internal static class AgentUidRecognition
++{
++    internal static (string? AccountId, string Source) Read(string focusedText, string fullText)
++    {
++        // In the dedicated bottom-right region Paddle may omit the narrow I.
++        // Digits must remain exact; bare numbers are never an account identity.
++        var focused = Extract(focusedText, @"\bU\s*[I1l|]?\s*D\s*[:：]?\s*(\d{8,10})(?!\d)");
++        if (focused.Length == 1) return (focused[0], "bottom_right_ocr");
++        if (focused.Length > 1) return (null, "conflicting_uid");
++        var fallback = Extract(fullText, @"\bUID\s*[:：]?\s*(\d{8,10})(?!\d)");
++        return fallback.Length == 1 ? (fallback[0], "full_frame_ocr")
++            : (null, fallback.Length > 1 ? "conflicting_uid" : "unreadable");
++    }
++
++    private static string[] Extract(string text, string pattern) => Regex.Matches(text, pattern,
++        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant).Cast<Match>()
++        .Select(match => match.Groups[1].Value).Distinct(StringComparer.Ordinal).ToArray();
++}
+diff --git a/BetterGenshinImpact/Service/Agent/AgentVideoRecorder.cs b/BetterGenshinImpact/Service/Agent/AgentVideoRecorder.cs
+new file mode 100644
+index 0000000..d2ef6fd
+--- /dev/null
++++ b/BetterGenshinImpact/Service/Agent/AgentVideoRecorder.cs
+@@ -0,0 +1,174 @@
++using System;
++using System.Diagnostics;
++using System.IO;
++using System.Security.Cryptography;
++using System.Threading;
++using System.Threading.Tasks;
++using Newtonsoft.Json.Linq;
++using OpenCvSharp;
++
++namespace BetterGenshinImpact.Service.Agent;
++
++internal sealed class AgentRecordingForegroundLostException : InvalidOperationException { }
++
++/// <summary>Game frames only, no audio/input. Finalize independent one-minute clips.</summary>
++internal sealed class AgentVideoRecorder(string directory, Func<Mat> capture) : IAsyncDisposable
++{
++    private const int Fps = 10;
++    private readonly CancellationTokenSource _stop = new();
++    private readonly JArray _clips = new();
++    private Task? _task;
++    private readonly object _gate = new();
++    private readonly DateTimeOffset _started = DateTimeOffset.UtcNow;
++    private long _frames;
++    private string? _error;
++    private string? _errorCode;
++    private string _stage = "starting";
++    internal event Action? Failed;
++
++    internal void Start()
++    {
++        lock (_gate)
++        {
++            if (_task != null) return;
++            Directory.CreateDirectory(directory);
++            _task = Task.Run(RecordAsync);
++        }
++    }
++
++    private void Status(string status)
++    {
++        var value = new JObject
++        {
++            ["schema_version"] = 1, ["status"] = status, ["source"] = "bettergi_game_window",
++            ["audio"] = false, ["fps"] = Fps, ["width"] = 1280, ["height"] = 720,
++            ["started_at"] = _started, ["updated_at"] = DateTimeOffset.UtcNow,
++            ["frames"] = _frames, ["clips"] = _clips.DeepClone(), ["error_type"] = _error,
++            ["error_code"] = _errorCode, ["error_stage"] = _error == null ? null : _stage
++        };
++        var path = Path.Combine(directory, "recording.json");
++        File.WriteAllText(path + ".tmp", value.ToString());
++        File.Move(path + ".tmp", path, true);
++    }
++
++    private async Task RecordAsync()
++    {
++        VideoWriter? writer = null;
++        string? path = null;
++        var framesInClip = 0;
++        var clipStarted = DateTimeOffset.UtcNow;
++        var clock = Stopwatch.StartNew();
++        var nextFrame = TimeSpan.Zero;
++        var status = "stopped";
++        try
++        {
++            using var timeline = new StreamWriter(Path.Combine(directory, "timeline.jsonl"), false);
++            while (!_stop.IsCancellationRequested && !File.Exists(Path.Combine(directory, "stop")))
++            {
++                if (clock.Elapsed > TimeSpan.FromHours(2))
++                    throw new TimeoutException("Recording lifetime exceeded.");
++                if (writer == null)
++                {
++                    _stage = "encoder_start";
++                    path = Path.Combine(directory, $"game-{_clips.Count + 1:D4}.mp4");
++                    if (File.Exists(path)) throw new IOException("Recording file already exists.");
++                    writer = new VideoWriter(path, VideoCaptureAPIs.FFMPEG,
++                        VideoWriter.FourCC('m', 'p', '4', 'v'), Fps, new Size(1280, 720));
++                    if (!writer.IsOpened()) throw new IOException("Video encoder could not start.");
++                    framesInClip = 0;
++                    clipStarted = DateTimeOffset.UtcNow;
++                }
++                _stage = "game_capture";
++                using var raw = capture();
++                if (raw.Empty()) throw new InvalidDataException("Empty game capture.");
++                using var bgr = new Mat();
++                _stage = "frame_encode";
++                if (raw.Channels() == 4) Cv2.CvtColor(raw, bgr, ColorConversionCodes.BGRA2BGR);
++                else if (raw.Channels() == 3) raw.CopyTo(bgr);
++                else throw new InvalidDataException("Unexpected game capture format.");
++                using var frame = new Mat();
++                Cv2.Resize(bgr, frame, new Size(1280, 720));
++                writer.Write(frame);
++                framesInClip++;
++                _frames++;
++                if (_frames % Fps == 1)
++                {
++                    _stage = "metadata_write";
++                    timeline.WriteLine(new JObject { ["frame"] = _frames,
++                        ["at"] = DateTimeOffset.UtcNow, ["elapsed_ms"] = clock.ElapsedMilliseconds }.ToString(Newtonsoft.Json.Formatting.None));
++                    timeline.Flush();
++                    Status("recording");
++                }
++                if (framesInClip >= Fps * 60)
++                {
++                    _stage = "clip_finalize";
++                    writer.Dispose();
++                    writer = null;
++                    FinalizeClip(path!, framesInClip, clipStarted);
++                }
++                nextFrame += TimeSpan.FromSeconds(1.0 / Fps);
++                // Never burst-capture to conceal a stall. The timeline preserves timing gaps.
++                if (nextFrame < clock.Elapsed) nextFrame = clock.Elapsed;
++                var delay = nextFrame - clock.Elapsed;
++                await Task.Delay(delay > TimeSpan.Zero ? delay : TimeSpan.Zero, _stop.Token).ConfigureAwait(false);
++            }
++        }
++        catch (OperationCanceledException) when (_stop.IsCancellationRequested) { }
++        catch (Exception error)
++        {
++            _error = error.GetType().Name;
++            _errorCode = error is AgentRecordingForegroundLostException ? "game_foreground_lost" : "recording_operation_failed";
++            status = "failed";
++        }
++        finally
++        {
++            try
++            {
++                if (writer != null)
++                {
++                    writer.Dispose();
++                    if (framesInClip > 0) FinalizeClip(path!, framesInClip, clipStarted);
++                }
++            }
++            catch (Exception error)
++            {
++                // Preserve the original cause when finalizing an already failed recording.
++                if (_error == null)
++                { _error = error.GetType().Name; _errorCode = "clip_finalization_failed"; _stage = "clip_finalize"; }
++                status = "failed";
++            }
++            try { Status(status); } catch (IOException) { /* Never impede input release. */ }
++            if (status == "failed") Failed?.Invoke();
++        }
++    }
++
++    private void FinalizeClip(string path, int frames, DateTimeOffset started)
++    {
++        // Verify a finalized container, including the last frame, before claiming a clip.
++        using var reader = new VideoCapture(path, VideoCaptureAPIs.FFMPEG);
++        using var decoded = new Mat();
++        if (!reader.IsOpened() || !reader.Read(decoded) || decoded.Empty()
++            || !reader.Set(VideoCaptureProperties.PosFrames, frames - 1)
++            || !reader.Read(decoded) || decoded.Empty())
++            throw new InvalidDataException("Finalized video could not be decoded.");
++        using var stream = File.OpenRead(path);
++        _clips.Add(new JObject { ["path"] = Path.GetFileName(path), ["frames"] = frames,
++            ["started_at"] = started, ["ended_at"] = DateTimeOffset.UtcNow,
++            ["duration_seconds"] = frames / (double)Fps, ["bytes"] = stream.Length,
++            ["sha256"] = Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant(),
++            ["decode_verified"] = true });
++    }
++
++    public async ValueTask DisposeAsync()
++    {
++        _stop.Cancel();
++        Task? task;
++        lock (_gate) task = _task;
++        if (task != null)
++        {
++            try { await task.WaitAsync(TimeSpan.FromSeconds(10)).ConfigureAwait(false); }
++            catch (TimeoutException) { return; } // Keep the worker's CTS alive until process exit.
++        }
++        _stop.Dispose();
++    }
++}
 diff --git a/BetterGenshinImpact/Service/Agent/BetterGiAgentBackend.cs b/BetterGenshinImpact/Service/Agent/BetterGiAgentBackend.cs
 new file mode 100644
+index 0000000..b9ad977
 --- /dev/null
 +++ b/BetterGenshinImpact/Service/Agent/BetterGiAgentBackend.cs
-@@ -0,0 +1,304 @@
+@@ -0,0 +1,358 @@
 +using System;
 +using System.Collections.Generic;
 +using System.Globalization;
++using System.Diagnostics;
++using System.Runtime.InteropServices;
 +using System.IO;
 +using System.Linq;
 +using System.Security.Cryptography;
@@ -866,7 +2905,10 @@ new file mode 100644
 +    private readonly SemaphoreSlim _captureGate = new(1, 1);
 +    private int _ownsTask;
 +    private readonly AgentDailyJournal _daily;
++    private readonly AgentResinSession? _resin;
 +    private readonly AgentVideoRecorder? _video;
++    private readonly AgentProgressSamples _progress = new();
++    private readonly Stopwatch _progressClock = Stopwatch.StartNew();
 +    internal JArray Options { get; }
 +    internal JObject Metadata { get; }
 +    internal event Action? ManualStop;
@@ -924,14 +2966,23 @@ new file mode 100644
 +            throw new InvalidDataException("Timed route policy must be an object.");
 +        var routeThreshold = AgentTimedRoutePolicy.Validate(
 +            routePolicy?.Value<int>("skip_optional_fights_below_seconds") ?? 0);
-+        _daily = new AgentDailyJournal(_resources, routeThreshold);
++        var memory = new AgentGoalMemory(Path.Combine(Path.GetDirectoryName(Path.GetFullPath(configurationPath))!, "goal-memory"),
++            configuration.Value<string>("goal_version") ?? "", Path.GetFileName(Path.GetDirectoryName(root)!));
++        _daily = new AgentDailyJournal(_resources, memory, routeThreshold);
++        if (configuration["resin_plan"] is JObject resinPlan)
++        {
++            if (configuration.Value<bool?>("record_video") != true) throw new InvalidDataException("Resin requires video.");
++            _resin = new AgentResinSession(Path.GetDirectoryName(Path.GetFullPath(configurationPath))!,
++                Path.GetDirectoryName(root)!, configuration.Value<string>("goal_version")!, resinPlan,
++                configuration.Value<string>("run_mode") == "development");
++        }
 +        if (configuration.Value<bool?>("record_video") == true)
 +        {
 +            // Derive from the pinned pack's run directory; no arbitrary output target.
 +            _video = new AgentVideoRecorder(Path.Combine(Path.GetDirectoryName(root)!, "video"), () =>
 +            {
 +                if (!SystemControl.IsGenshinImpactActiveByProcess())
-+                    throw new InvalidOperationException("Game window lost foreground.");
++                    throw new AgentRecordingForegroundLostException();
 +                using var region = TaskControl.CaptureToRectArea();
 +                return region.SrcMat.Clone();
 +            });
@@ -941,20 +2992,25 @@ new file mode 100644
 +        foreach (var option in Options.Cast<JObject>())
 +        {
 +            var skill = option.Value<string>("skill");
-+            if (skill is not ("observe.capture" or "path.run" or "dialogue.select" or "daily.scan" or "daily.execute" or "daily.claim"))
++            if (_resin != null ? skill is not ("resin.scan" or "resin.domain")
++                : skill is not ("observe.capture" or "path.run" or "dialogue.select" or "daily.scan" or "daily.execute" or "daily.claim"))
 +                throw new InvalidDataException("Agent task pack references an unsupported native skill.");
 +            if (skill != "observe.capture" && (option["preconditions"]?["account_verified"]?.Type != JTokenType.Boolean
 +                || option["preconditions"]?.Value<bool>("account_verified") != true
 +                || option["preconditions"]?.Value<bool>("foreground") != true))
 +                throw new InvalidDataException("Input skills must guard the account and foreground window.");
 +        }
++        if (_resin == null) foreach (var option in AgentRecoveryActions.Catalog()) Options.Add(option);
 +        Metadata = new JObject
 +        {
 +            ["protocol_version"] = 1, ["manifest_file_sha256"] = Convert.ToHexString(SHA256.HashData(manifestRaw)).ToLowerInvariant(),
 +            ["decision_model"] = manifest["decision_model"]!.DeepClone(),
 +            ["environment"] = "windows", ["release_status"] = "development",
 +            ["timed_route_policy"] = new JObject { ["skip_optional_fights_below_seconds"] = routeThreshold },
-+            ["game_video_v1"] = _video != null
++            ["game_video_v1"] = _video != null, ["resin_v1"] = _resin != null,
++            ["resin_plan"] = configuration["resin_plan"]?.DeepClone(),
++            ["daily_goal_control_v1"] = true, ["daily_recovery_v1"] = true,
++            ["recovery_catalog"] = AgentRecoveryActions.Catalog()
 +        };
 +    }
 +
@@ -1006,7 +3062,24 @@ new file mode 100644
 +                    ["region"] = _binding.Value<string>("region"), ["region_source"] = "configured_task_region"
 +                };
 +                var daily = _daily.Snapshot();
-+                facts.Merge(daily.Facts);
++                if (_resin == null) facts.Merge(daily.Facts);
++                else facts.Merge(_resin.Snapshot());
++                var grounded = scene == "world" && Bv.GetMotionStatus(region) == MotionStatus.Normal;
++                facts["daily_recovery_v1"] = _resin == null;
++                facts["daily_recovery_grounded"] = grounded;
++                facts["player_low_hp"] = scene == "world" ? new JValue(Bv.CurrentAvatarIsLowHp(region)) : JValue.CreateNull();
++                facts["daily_review_interruptible"] = scene == "world" && _daily.ReviewInterruptible
++                    && grounded;
++                using (var crop = region.SrcMat.SubMat(new Rect(width / 5, height / 6, width * 3 / 5, height * 3 / 5)))
++                using (var small = new Mat())
++                using (var gray = new Mat())
++                {
++                    Cv2.Resize(crop, small, new Size(32, 18));
++                    Cv2.CvtColor(small, gray, ColorConversionCodes.BGR2GRAY);
++                    var pixels = new byte[32 * 18]; Marshal.Copy(gray.Data, pixels, 0, pixels.Length);
++                    var phaseKey = $"{daily.Facts["daily_goal"]?["active_quest_id"]}:{daily.Facts["daily_goal"]?["phase_revision"]}:{scene}";
++                    facts["execution_progress"] = _progress.Observe(phaseKey, _progressClock.ElapsedMilliseconds, pixels);
++                }
 +                Cv2.ImEncode(".png", region.SrcMat, out var png);
 +                cancellationToken.ThrowIfCancellationRequested();
 +                return new GameObservation(scope, facts, new[] { "data:image/png;base64," + Convert.ToBase64String(png) }.Concat(daily.Images).Distinct().ToArray());
@@ -1046,12 +3119,30 @@ new file mode 100644
 +            try
 +            {
 +                var arguments = option["arguments"] as JObject ?? new JObject();
++                if (_resin != null)
++                {
++                    var current = await CaptureAsync(token).ConfigureAwait(false);
++                    if (current.Facts.Value<bool?>("account_verified") != true) throw new InvalidOperationException("Account not verified.");
++                    await _resin.Execute(option.Value<string>("skill")!, current.Scope, token).ConfigureAwait(false);
++                    return new SkillOutcome("succeeded", "resin_operation_verified", new JObject { ["after_facts"] = _resin.Snapshot() });
++                }
 +                if ((option.Value<string>("skill") ?? "").StartsWith("daily.", StringComparison.Ordinal))
 +                {
 +                    var current = await CaptureAsync(token).ConfigureAwait(false);
-+                    await _daily.ExecuteAsync(option.Value<string>("skill")!, arguments, current.Scope, token).ConfigureAwait(false);
-+                    var afterDaily = await CaptureAsync(token).ConfigureAwait(false);
-+                    return new SkillOutcome("succeeded", "daily_operation_finished_requires_journal_evidence",
++                    var receiptStop = false;
++                    try { await _daily.ExecuteAsync(option.Value<string>("skill")!, arguments, current.Scope, token).ConfigureAwait(false); }
++                    catch (Exception) when (option.Value<string>("skill") is "daily.execute" or "daily.recover"
++                        && _daily.CommissionRewardReceived && !cancellationToken.IsCancellationRequested
++                        && !CancellationContext.Instance.IsManualStop)
++                    {
++                        receiptStop = true;
++                        InputHub.ReleaseAll();
++                    }
++                    // Outer user/lease cancellation still takes precedence over a receipt.
++                    cancellationToken.ThrowIfCancellationRequested();
++                    var afterDaily = await CaptureAsync(receiptStop ? cancellationToken : token).ConfigureAwait(false);
++                    return new SkillOutcome("succeeded", receiptStop ? "commission_primogems_received_requires_journal_evidence"
++                        : "daily_operation_finished_requires_journal_evidence",
 +                        new JObject { ["after_facts"] = afterDaily.Facts });
 +                }
 +                if (option.Value<string>("skill") == "path.run")
@@ -1138,6 +3229,7 @@ new file mode 100644
 +}
 diff --git a/BetterGenshinImpact/Service/Agent/StartLuxAgentBridgeService.cs b/BetterGenshinImpact/Service/Agent/StartLuxAgentBridgeService.cs
 new file mode 100644
+index 0000000..a1eb767
 --- /dev/null
 +++ b/BetterGenshinImpact/Service/Agent/StartLuxAgentBridgeService.cs
 @@ -0,0 +1,43 @@
@@ -1186,7 +3278,7 @@ new file mode 100644
 +}
 diff --git a/Test/BetterGenshinImpact.AgentBridge.Fixture/BetterGenshinImpact.AgentBridge.Fixture.csproj b/Test/BetterGenshinImpact.AgentBridge.Fixture/BetterGenshinImpact.AgentBridge.Fixture.csproj
 new file mode 100644
-index 00000000..403fa84c
+index 0000000..403fa84
 --- /dev/null
 +++ b/Test/BetterGenshinImpact.AgentBridge.Fixture/BetterGenshinImpact.AgentBridge.Fixture.csproj
 @@ -0,0 +1,11 @@
@@ -1203,7 +3295,7 @@ index 00000000..403fa84c
 +</Project>
 diff --git a/Test/BetterGenshinImpact.AgentBridge.Fixture/Program.cs b/Test/BetterGenshinImpact.AgentBridge.Fixture/Program.cs
 new file mode 100644
-index 00000000..0b8adab3
+index 0000000..0b8adab
 --- /dev/null
 +++ b/Test/BetterGenshinImpact.AgentBridge.Fixture/Program.cs
 @@ -0,0 +1,51 @@
@@ -1260,9 +3352,10 @@ index 00000000..0b8adab3
 +}
 diff --git a/Test/BetterGenshinImpact.AgentBridge.Tests/AgentBridgeTests.cs b/Test/BetterGenshinImpact.AgentBridge.Tests/AgentBridgeTests.cs
 new file mode 100644
+index 0000000..057241a
 --- /dev/null
 +++ b/Test/BetterGenshinImpact.AgentBridge.Tests/AgentBridgeTests.cs
-@@ -0,0 +1,241 @@
+@@ -0,0 +1,287 @@
 +using System.Buffers.Binary;
 +using BetterGenshinImpact.AgentBridge;
 +using Newtonsoft.Json.Linq;
@@ -1369,6 +3462,52 @@ new file mode 100644
 +        Assert.Equal("unknown", host.Checkpoint("command-1").Value<string>("status"));
 +        Assert.Equal("unknown", host.Checkpoint("missing").Value<string>("status"));
 +        Assert.False(backend.Cancelled.Task.IsCompleted);
++    }
++
++    [Theory]
++    [InlineData("safe", "daily.execute")]
++    [InlineData("airborne", "daily.execute")]
++    [InlineData("old_frame", "daily.execute")]
++    [InlineData("manual_stop", "daily.execute")]
++    [InlineData("no_capability", "daily.execute")]
++    [InlineData("foreground_lost", "daily.execute")]
++    [InlineData("safe", "daily.recover")]
++    [InlineData("airborne", "daily.recover")]
++    [InlineData("old_frame", "daily.recover")]
++    [InlineData("manual_stop", "daily.recover")]
++    [InlineData("no_capability", "daily.recover")]
++    [InlineData("foreground_lost", "daily.recover")]
++    public async Task ModelCheckpointNeedsFreshSafeFrameAndPreservesStop(string scenario, string skill)
++    {
++        var backend = new Backend();
++        backend.Facts["foreground"] = true;
++        backend.Facts["daily_review_interruptible"] = true;
++        var option = (JObject)Option.DeepClone();
++        option["skill"] = skill;
++        await using var host = new AgentCommandHost(backend, new JArray(option),
++            metadata: new JObject { ["daily_goal_control_v1"] = scenario != "no_capability" });
++        host.Arm();
++        var before = await host.ObserveAsync(CancellationToken.None);
++        await host.StartAsync(Command(before, option: option), CancellationToken.None);
++        await backend.Started.Task.WaitAsync(TimeSpan.FromSeconds(2));
++        if (scenario == "airborne") backend.Facts["daily_review_interruptible"] = false;
++        if (scenario == "foreground_lost") backend.Facts["foreground"] = false;
++        var current = await host.ObserveAsync(CancellationToken.None);
++        if (scenario == "manual_stop") host.Stop();
++        var result = host.Checkpoint("command-1", scenario == "old_frame"
++            ? before.Value<long>("frame_id") : current.Value<long>("frame_id"));
++        if (scenario == "safe")
++        {
++            await backend.Cancelled.Task.WaitAsync(TimeSpan.FromSeconds(2));
++            Assert.Equal(before.Value<long>("control_generation"),
++                (await host.ObserveAsync(CancellationToken.None)).Value<long>("control_generation"));
++        }
++        else if (scenario == "manual_stop") Assert.Equal("unknown", result.Value<string>("status"));
++        else
++        {
++            Assert.Equal("review_checkpoint_not_safe", result.Value<string>("reason"));
++            Assert.False(backend.Cancelled.Task.IsCompleted);
++        }
 +    }
 +
 +    [Fact]
@@ -1504,159 +3643,294 @@ new file mode 100644
 +        await Assert.ThrowsAsync<EndOfStreamException>(() => AgentPipeProtocol.ReadAsync(new MemoryStream(header), CancellationToken.None));
 +    }
 +}
-diff --git a/Test/BetterGenshinImpact.AgentBridge.Tests/BetterGenshinImpact.AgentBridge.Tests.csproj b/Test/BetterGenshinImpact.AgentBridge.Tests/BetterGenshinImpact.AgentBridge.Tests.csproj
+diff --git a/Test/BetterGenshinImpact.AgentBridge.Tests/AgentCommissionReceiptTests.cs b/Test/BetterGenshinImpact.AgentBridge.Tests/AgentCommissionReceiptTests.cs
 new file mode 100644
-index 0000000..6d4bcd8
+index 0000000..7a3ff22
 --- /dev/null
-+++ b/Test/BetterGenshinImpact.AgentBridge.Tests/BetterGenshinImpact.AgentBridge.Tests.csproj
-@@ -0,0 +1,23 @@
-+<Project Sdk="Microsoft.NET.Sdk">
-+  <PropertyGroup>
-+    <TargetFramework>net8.0</TargetFramework>
-+    <ImplicitUsings>enable</ImplicitUsings>
-+    <Nullable>enable</Nullable>
-+    <IsTestProject>true</IsTestProject>
-+    <IsPackable>false</IsPackable>
-+  </PropertyGroup>
-+  <ItemGroup>
-+    <Compile Include="../../BetterGenshinImpact/Service/Agent/AgentFlightInput.cs" Link="AgentFlightInput.cs" />
-+    <Compile Include="../../BetterGenshinImpact/Service/Agent/AgentUidRecognition.cs" Link="AgentUidRecognition.cs" />
-+    <Compile Include="../../BetterGenshinImpact/Service/Agent/AgentJournalRows.cs" Link="AgentJournalRows.cs" />
-+    <Compile Include="../../BetterGenshinImpact/Service/Agent/AgentRecoveryUi.cs" Link="AgentRecoveryUi.cs" />
-+    <Compile Include="../../BetterGenshinImpact/Service/Agent/AgentScriptInput.cs" Link="AgentScriptInput.cs" />
-+    <Compile Include="../../BetterGenshinImpact/Service/Agent/AgentTimedRoutePolicy.cs" Link="AgentTimedRoutePolicy.cs" />
-+    <Compile Include="../../BetterGenshinImpact/Service/Agent/AgentVideoRecorder.cs" Link="AgentVideoRecorder.cs" />
-+    <PackageReference Include="OpenCvSharp4.Windows" Version="4.11.0.20250507" />
-+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.8.0" />
-+    <PackageReference Include="xunit" Version="2.5.3" />
-+    <PackageReference Include="xunit.runner.visualstudio" Version="2.5.3" />
-+    <ProjectReference Include="../../BetterGenshinImpact.AgentBridge/BetterGenshinImpact.AgentBridge.csproj" />
-+  </ItemGroup>
-+</Project>
-diff --git a/BetterGenshinImpact/Service/Agent/AgentUidRecognition.cs b/BetterGenshinImpact/Service/Agent/AgentUidRecognition.cs
-new file mode 100644
---- /dev/null
-+++ b/BetterGenshinImpact/Service/Agent/AgentUidRecognition.cs
-@@ -0,0 +1,24 @@
-+using System;
-+using System.Linq;
-+using System.Text.RegularExpressions;
-+
-+namespace BetterGenshinImpact.Service.Agent;
-+
-+internal static class AgentUidRecognition
-+{
-+    internal static (string? AccountId, string Source) Read(string focusedText, string fullText)
-+    {
-+        // In the dedicated bottom-right region Paddle may omit the narrow I.
-+        // Digits must remain exact; bare numbers are never an account identity.
-+        var focused = Extract(focusedText, @"\bU\s*[I1l|]?\s*D\s*[:：]?\s*(\d{8,10})(?!\d)");
-+        if (focused.Length == 1) return (focused[0], "bottom_right_ocr");
-+        if (focused.Length > 1) return (null, "conflicting_uid");
-+        var fallback = Extract(fullText, @"\bUID\s*[:：]?\s*(\d{8,10})(?!\d)");
-+        return fallback.Length == 1 ? (fallback[0], "full_frame_ocr")
-+            : (null, fallback.Length > 1 ? "conflicting_uid" : "unreadable");
-+    }
-+
-+    private static string[] Extract(string text, string pattern) => Regex.Matches(text, pattern,
-+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant).Cast<Match>()
-+        .Select(match => match.Groups[1].Value).Distinct(StringComparer.Ordinal).ToArray();
-+}
-diff --git a/Test/BetterGenshinImpact.AgentBridge.Tests/AgentUidRecognitionTests.cs b/Test/BetterGenshinImpact.AgentBridge.Tests/AgentUidRecognitionTests.cs
-new file mode 100644
---- /dev/null
-+++ b/Test/BetterGenshinImpact.AgentBridge.Tests/AgentUidRecognitionTests.cs
-@@ -0,0 +1,40 @@
++++ b/Test/BetterGenshinImpact.AgentBridge.Tests/AgentCommissionReceiptTests.cs
+@@ -0,0 +1,77 @@
 +using BetterGenshinImpact.Service.Agent;
 +using Xunit;
 +
-+public class AgentUidRecognitionTests
++public sealed class AgentCommissionReceiptTests
 +{
-+    [Theory]
-+    [InlineData("UID:123456789")]
-+    [InlineData("Q\nE\nUD:123456789")]
-+    [InlineData("U1D：123456789")]
-+    [InlineData("U I D 123456789")]
-+    public void FocusedBannerRetainsExactDigits(string text)
++    [Fact]
++    public void RealPaddleV6ToastWithoutMultiplicationGlyphIsRecognized()
 +    {
-+        var result = AgentUidRecognition.Read(text, "");
-+        Assert.Equal("123456789", result.AccountId);
-+        Assert.Equal("bottom_right_ocr", result.Source);
++        var detector = new AgentCommissionReceipt();
++        detector.Observe(0, "", "");
++        detector.Observe(1000, "委托完成", "");
++        Assert.False(detector.Observe(4000, "", "委托奖励\n原石10\n冒险阅历250"));
++        Assert.True(detector.Observe(4250, "", "原石10\n冒险阅历250"));
++        Assert.Equal(10, detector.Amount);
++    }
++
++    [Fact]
++    public void PopupRequiresFreshCompletionAndDoesNotInventQuantity()
++    {
++        var detector = new AgentCommissionReceipt();
++        detector.Observe(0, "", "");
++        Assert.False(detector.Observe(1000, "", "", true));
++        Assert.False(detector.Observe(1250, "", "", true));
++        Assert.False(detector.Observe(2000, "委托完成", "", true));
++        Assert.True(detector.Observe(2250, "委托完成", "", true));
++        Assert.Null(detector.Amount);
++    }
++
++    [Fact]
++    public void ReceiptStopsAfterFreshBannerAndTwoFramesEvenWithNearbyEnemies()
++    {
++        var detector = new AgentCommissionReceipt();
++        Assert.False(detector.Observe(0, "攀高危险 1/2", ""));
++        Assert.False(detector.Observe(1000, "委托完成", ""));
++        Assert.False(detector.Observe(4000, "", "原石 × 10 冒险阅历 × 250"));
++        Assert.True(detector.Observe(4250, "敌人增援来袭", "原石 × 10 冒险阅历 × 250"));
 +    }
 +
 +    [Theory]
-+    [InlineData("123456789")]
-+    [InlineData("UID:1234567")]
-+    [InlineData("UID:12345678999")]
-+    [InlineData("GUID:123456789")]
-+    public void UnlabelledOrInvalidNumbersCannotVerifyAnAccount(string text)
-+        => Assert.Null(AgentUidRecognition.Read(text, "").AccountId);
-+
-+    [Fact]
-+    public void ConflictingFocusedBannersDoNotUseAConvenientFallback()
-+        => Assert.Null(AgentUidRecognition.Read("UID:123456789\nUID:999999999", "UID:123456789").AccountId);
-+
-+    [Fact]
-+    public void ActiveAccountBannerTakesPrecedenceOverAnotherProfileInTheFullFrame()
-+        => Assert.Equal("123456789", AgentUidRecognition.Read("UID:123456789", "UID:999999999").AccountId);
-+
-+    [Fact]
-+    public void FullFrameFallbackRequiresOneUnambiguousLabelledUid()
++    [InlineData("", "原石 × 10")]
++    [InlineData("委托完成", "原石 × 100")]
++    [InlineData("委托完成", "原石 × 20")]
++    [InlineData("委托完成", "摩拉 × 10")]
++    [InlineData("", "战斗超时")]
++    public void UnrelatedRewardsMissingGemsAndTimeoutAreNeverSuccess(string banner, string loot)
 +    {
-+        Assert.Equal("full_frame_ocr", AgentUidRecognition.Read("", "UID:123456789").Source);
-+        Assert.Null(AgentUidRecognition.Read("", "UID:123456789\nUID:999999999").AccountId);
++        var detector = new AgentCommissionReceipt();
++        detector.Observe(0, "", "");
++        Assert.False(detector.Observe(1000, banner, loot));
++        Assert.False(detector.Observe(1250, banner, loot));
++    }
++
++    [Fact]
++    public void PreviousQuestToastMustClearAndExpiredBannerCannotMatch()
++    {
++        var detector = new AgentCommissionReceipt();
++        Assert.False(detector.Observe(0, "委托完成", "委托奖励 原石×10"));
++        Assert.False(detector.Observe(500, "", "委托奖励 原石×10"));
++        detector.Observe(1000, "", "");
++        detector.Observe(2000, "委托完成", "");
++        Assert.False(detector.Observe(11000, "", "原石×10"));
++        Assert.False(detector.Observe(11250, "", "原石×10"));
++        Assert.False(detector.Observe(12000, "", "委托奖励 原石×10"));
++        Assert.True(detector.Observe(12250, "", "委托奖励 原石×10"));
++    }
++
++    [Fact]
++    public void SingleFrameAndLongGapsCannotTriggerReceipt()
++    {
++        var detector = new AgentCommissionReceipt();
++        detector.Observe(0, "", "");
++        Assert.False(detector.Observe(1000, "委托完成", "委托奖励 原石×10"));
++        Assert.False(detector.Observe(1000, "委托完成", "委托奖励 原石×10"));
++        Assert.False(detector.Observe(4000, "委托完成", "委托奖励 原石×10"));
++        Assert.True(detector.Observe(4250, "", "委托奖励 原石×10"));
 +    }
 +}
-diff --git a/BetterGenshinImpact/Service/Agent/AgentJournalRows.cs b/BetterGenshinImpact/Service/Agent/AgentJournalRows.cs
+diff --git a/Test/BetterGenshinImpact.AgentBridge.Tests/AgentFlightInputTests.cs b/Test/BetterGenshinImpact.AgentBridge.Tests/AgentFlightInputTests.cs
 new file mode 100644
+index 0000000..c045112
 --- /dev/null
-+++ b/BetterGenshinImpact/Service/Agent/AgentJournalRows.cs
-@@ -0,0 +1,43 @@
-+using System;
-+using System.Collections.Generic;
-+using System.IO;
-+using System.Linq;
-+using Newtonsoft.Json.Linq;
++++ b/Test/BetterGenshinImpact.AgentBridge.Tests/AgentFlightInputTests.cs
+@@ -0,0 +1,49 @@
++using BetterGenshinImpact.Service.Agent;
++using Xunit;
 +
-+namespace BetterGenshinImpact.Service.Agent;
++namespace BetterGenshinImpact.AgentBridge.Tests;
 +
-+/// <summary>Bind changing handbook positions to stable commission identities.</summary>
-+internal static class AgentJournalRows
++public class AgentFlightInputTests
 +{
-+    internal static (JArray Rows, Dictionary<int, JObject> Evidence) Bind(
-+        JArray previous, JArray observed, IReadOnlyDictionary<int, JObject> observations)
++    [Fact]
++    public void MissingHintCannotRapidlyToggleGlider()
 +    {
-+        if (observed.Count != 4
-+            || !observed.Select(r => r.Value<int>("id")).Order().SequenceEqual(new[] { 1, 2, 3, 4 })
-+            || observed.Any(r => string.IsNullOrWhiteSpace(r.Value<string>("name")))
-+            || observed.Select(r => r.Value<string>("name")).Distinct(StringComparer.Ordinal).Count() != 4)
-+            throw new InvalidDataException("All four unique journal identities must be recognized.");
++        var input = new AgentFlightInput();
++        Assert.True(input.ShouldOpen(false, 0));
++        Assert.False(input.ShouldOpen(false, 300));
++        Assert.False(input.ShouldOpen(true, 500));
++        Assert.False(input.ShouldOpen(false, 1000)); // one bad frame
++        Assert.True(input.ShouldOpen(false, 1200));
++        Assert.False(input.ShouldOpen(false, 1300));
++        Assert.False(input.ShouldOpen(true, 1500));
++    }
 +
-+        var identities = (previous.Count == 0 ? observed : previous)
-+            .ToDictionary(r => r.Value<string>("name")!, r => r.Value<int>("id"), StringComparer.Ordinal);
-+        if (identities.Count != 4 || observed.Any(r => !identities.ContainsKey(r.Value<string>("name")!)))
-+            throw new InvalidDataException("Journal identities changed; manual review is required.");
++    [Fact]
++    public async Task PulseSpansFramesAndWaitsForFreshCapture()
++    {
++        var calls = new List<string>();
++        await AgentFlightInput.Pulse(() => calls.Add("down"), () => calls.Add("up"),
++            (ms, ct) => { calls.Add(ms.ToString()); return Task.CompletedTask; }, default);
++        Assert.Equal(new[] { "down", "100", "up", "300" }, calls);
++    }
 +
-+        var rows = new List<JObject>();
-+        var evidence = new Dictionary<int, JObject>();
-+        foreach (var observedRow in observed)
-+        {
-+            var visibleSlot = observedRow.Value<int>("id");
-+            if (!observations.TryGetValue(visibleSlot, out var observation))
-+                throw new InvalidDataException("Each journal row requires an unambiguous visual status.");
-+            var row = (JObject)observedRow.DeepClone();
-+            var stableSlot = identities[row.Value<string>("name")!];
-+            row["id"] = stableSlot;
-+            var proof = (JObject)observation.DeepClone();
-+            proof["quest_id"] = $"{stableSlot}:{row["name"]}";
-+            rows.Add(row);
-+            evidence.Add(stableSlot, proof);
-+        }
-+        return (new JArray(rows.OrderBy(r => r.Value<int>("id"))), evidence);
++    [Fact]
++    public async Task CancellationReleasesHeldInput()
++    {
++        var calls = new List<string>();
++        using var source = new CancellationTokenSource();
++        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => AgentFlightInput.Pulse(
++            () => calls.Add("down"), () => calls.Add("up"),
++            (ms, ct) => { source.Cancel(); ct.ThrowIfCancellationRequested(); return Task.CompletedTask; }, source.Token));
++        Assert.Equal(new[] { "down", "up" }, calls);
++    }
++
++    [Fact]
++    public async Task AlreadyCancelledNeverPresses()
++    {
++        var calls = new List<string>();
++        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => AgentFlightInput.Pulse(
++            () => calls.Add("down"), () => calls.Add("up"), Task.Delay, new CancellationToken(true)));
++        Assert.Empty(calls);
++    }
++}
+diff --git a/Test/BetterGenshinImpact.AgentBridge.Tests/AgentGoalMemoryTests.cs b/Test/BetterGenshinImpact.AgentBridge.Tests/AgentGoalMemoryTests.cs
+new file mode 100644
+index 0000000..775f537
+--- /dev/null
++++ b/Test/BetterGenshinImpact.AgentBridge.Tests/AgentGoalMemoryTests.cs
+@@ -0,0 +1,85 @@
++using BetterGenshinImpact.Service.Agent;
++using Newtonsoft.Json.Linq;
++using Xunit;
++
++namespace BetterGenshinImpact.AgentBridge.Tests;
++
++public sealed class AgentGoalMemoryTests : IDisposable
++{
++    private readonly string _root = Path.Combine(Path.GetTempPath(), "goal-memory-test-" + Guid.NewGuid().ToString("N"));
++    private static JObject Scope(string day = "2026-10-22", string account = "test-account") => new()
++        { ["account_id"] = account, ["server_id"] = "test", ["game_day"] = day };
++    private AgentGoalMemory Open(string version = "a", string day = "2026-10-22", string account = "test-account")
++    {
++        var memory = new AgentGoalMemory(_root, new string(version[0], 64), Guid.NewGuid().ToString("N"));
++        memory.Bind(Scope(day, account));
++        memory.BindRoster(new[] { "one", "two", "three", "four" });
++        return memory;
++    }
++    private static JArray Rows(bool reordered = false) => new(Enumerable.Range(1, 4).Select(i => new JObject
++        { ["id"] = i, ["name"] = (reordered ? new[] { "two", "one", "three", "four" }
++            : new[] { "one", "two", "three", "four" })[i - 1], ["location"] = "fixture" }));
++    [Fact]
++    public void RestartAndChangedVersionCannotEraseReservations()
++    {
++        var first = Open(); first.Reserve("one", "fixture", "default"); // simulated crash, no outcome
++        var second = Open();
++        Assert.Equal(1, second.Used("one"));
++        Assert.False(second.CanUseDefault("one"));
++        Assert.Equal("reserved", second.History("one")[0]!.Value<string>("status"));
++        var nextVersion = Open("b");
++        Assert.True(nextVersion.CanUseDefault("one"));
++        var id = nextVersion.Reserve("one", "fixture", "default"); nextVersion.Verify(id, false);
++        Assert.Equal(2, Open("c").Used("one"));
++        Assert.Throws<InvalidOperationException>(() => Open("c").Reserve("one", "fixture", "heal_retry"));
++        Assert.Equal(0, Open(day: "2026-10-23").Used("one"));
++        Assert.Equal(0, Open(account: "another-account").Used("one"));
++    }
++    [Fact]
++    public void ReorderedSlotsKeepBudgetAndRestartDisallowsStaleLocationRecovery()
++    {
++        var memory = Open(); var first = new AgentGoalProgress(memory); first.BindRows(Rows());
++        first.Begin(1, "one"); first.Verify(false);
++        Assert.False(first.Available(1)); Assert.True(first.LocalRecovery(1));
++        var restarted = new AgentGoalProgress(Open()); restarted.BindRows(Rows(true));
++        Assert.False(restarted.Available(2)); Assert.True(restarted.Available(1));
++        Assert.True(restarted.CanRetry(2)); Assert.False(restarted.LocalRecovery(2));
++        Assert.Throws<InvalidOperationException>(() => restarted.Begin(2, "one", "ranged"));
++        restarted.Begin(2, "one", "heal_retry"); restarted.Verify(false);
++        Assert.False(restarted.CanRetry(2));
++        Assert.Equal(2, restarted.Snapshot()["failed_attempts_by_slot"]!.Value<int>("2"));
++    }
++    [Fact]
++    public void CompletingRecoveryRequiresJournalVerificationAndDoesNotAddExtraBudget()
++    {
++        var memory = Open(); var goal = new AgentGoalProgress(memory); goal.BindRows(Rows());
++        goal.Begin(1, "one"); goal.Verify(false); goal.Begin(1, "one", "reposition_left");
++        Assert.Equal("reserved", memory.History("one")[1]!.Value<string>("status"));
++        Assert.False(goal.LocalRecovery(1));
++        goal.Verify(true);
++        Assert.Equal("completed", memory.History("one")[1]!.Value<string>("status"));
++        Assert.True(goal.Snapshot()["last_verification"]!.Value<bool>("completed"));
++        Assert.False(goal.Available(1)); Assert.False(goal.CanRetry(1));
++        goal.Verify(false); // scanning again cannot turn success into failure
++        Assert.Equal("completed", memory.History("one")[1]!.Value<string>("status"));
++    }
++    [Fact]
++    public void ChangedRosterAndCorruptMemoryFailClosedWithoutOverwritingEvidence()
++    {
++        var memory = Open(); memory.Reserve("one", "fixture", "default");
++        Assert.Throws<InvalidDataException>(() => memory.BindRoster(new[] { "renamed", "two", "three", "four" }));
++        Assert.Throws<InvalidOperationException>(() => memory.Bind(Scope("2026-10-23")));
++        var file = Directory.GetFiles(_root, "*.json").Single(); File.WriteAllText(file, "{broken-evidence");
++        Assert.ThrowsAny<Exception>(() => Open());
++        Assert.Equal("{broken-evidence", File.ReadAllText(file));
++    }
++    [Fact]
++    public void OtherQuestClearsLocalRecoveryButDoesNotEraseItsFailure()
++    {
++        var goal = new AgentGoalProgress(Open()); goal.BindRows(Rows());
++        goal.Begin(1, "one"); goal.Verify(false); goal.Begin(2, "two"); goal.Verify(true);
++        Assert.False(goal.LocalRecovery(1)); Assert.True(goal.CanRetry(1));
++        Assert.Equal(1, goal.Snapshot()["failed_attempts_by_slot"]!.Value<int>("1"));
++    }
++    public void Dispose() { if (Directory.Exists(_root)) Directory.Delete(_root, true); }
++}
+diff --git a/Test/BetterGenshinImpact.AgentBridge.Tests/AgentGoalProgressTests.cs b/Test/BetterGenshinImpact.AgentBridge.Tests/AgentGoalProgressTests.cs
+new file mode 100644
+index 0000000..8122b93
+--- /dev/null
++++ b/Test/BetterGenshinImpact.AgentBridge.Tests/AgentGoalProgressTests.cs
+@@ -0,0 +1,50 @@
++using BetterGenshinImpact.Service.Agent;
++using Xunit;
++
++namespace BetterGenshinImpact.AgentBridge.Tests;
++
++public sealed class AgentGoalProgressTests
++{
++    [Fact]
++    public void TwoVerifiedFailuresDeferOnlyThatQuest()
++    {
++        var goal = new AgentGoalProgress();
++        goal.Begin(1, "fixture");
++        Assert.Throws<InvalidOperationException>(() => goal.Begin(2, "other"));
++        goal.Verify(false);
++        Assert.True(goal.Available(1));
++        goal.Begin(1, "fixture");
++        goal.Verify(false);
++        Assert.False(goal.Available(1));
++        Assert.True(goal.Available(2));
++        Assert.Throws<InvalidOperationException>(() => goal.Begin(1, "fixture"));
++        goal.Begin(2, "other");
++        goal.Verify(true);
++        Assert.True(goal.Snapshot()["last_verification"]!.Value<bool>("completed"));
++        Assert.Equal(2, goal.Snapshot()["failed_attempts_by_slot"]!.Value<int>("1"));
++    }
++
++    [Fact]
++    public void RescanningDoesNotConsumeAnotherAttemptAndCannotInventSuccess()
++    {
++        var goal = new AgentGoalProgress();
++        goal.Begin(1, "fixture");
++        goal.Verify(false);
++        goal.Verify(true);
++        Assert.False(goal.Snapshot()["last_verification"]!.Value<bool>("completed"));
++        Assert.Equal(1, goal.Snapshot()["failed_attempts_by_slot"]!.Value<int>("1"));
++    }
++
++    [Fact]
++    public void TimedRouteAndPhaseAreExplicit()
++    {
++        var goal = new AgentGoalProgress();
++        goal.Begin(1, "极速前进");
++        Assert.True(goal.TimedRoute);
++        goal.Phase("route");
++        Assert.Equal("route", goal.Snapshot().Value<string>("phase"));
++        Assert.Throws<ArgumentException>(() => goal.Phase("invented_success"));
++        goal.Verify(false);
++        Assert.False(goal.TimedRoute);
 +    }
 +}
 diff --git a/Test/BetterGenshinImpact.AgentBridge.Tests/AgentJournalRowsTests.cs b/Test/BetterGenshinImpact.AgentBridge.Tests/AgentJournalRowsTests.cs
 new file mode 100644
+index 0000000..711abff
 --- /dev/null
 +++ b/Test/BetterGenshinImpact.AgentBridge.Tests/AgentJournalRowsTests.cs
 @@ -0,0 +1,57 @@
@@ -1717,31 +3991,51 @@ new file mode 100644
 +        Assert.Throws<InvalidDataException>(() => AgentJournalRows.Bind(new JArray(), Rows("A", "B", "C", "D"), observations));
 +    }
 +}
-diff --git a/BetterGenshinImpact/Service/Agent/AgentRecoveryUi.cs b/BetterGenshinImpact/Service/Agent/AgentRecoveryUi.cs
+diff --git a/Test/BetterGenshinImpact.AgentBridge.Tests/AgentProgressSamplesTests.cs b/Test/BetterGenshinImpact.AgentBridge.Tests/AgentProgressSamplesTests.cs
 new file mode 100644
+index 0000000..fd60daa
 --- /dev/null
-+++ b/BetterGenshinImpact/Service/Agent/AgentRecoveryUi.cs
-@@ -0,0 +1,18 @@
-+using System;
-+using System.Text.RegularExpressions;
-+
-+namespace BetterGenshinImpact.Service.Agent;
-+
-+internal static class AgentRecoveryUi
++++ b/Test/BetterGenshinImpact.AgentBridge.Tests/AgentProgressSamplesTests.cs
+@@ -0,0 +1,36 @@
++using BetterGenshinImpact.Service.Agent;
++using Xunit;
++namespace BetterGenshinImpact.AgentBridge.Tests;
++public sealed class AgentProgressSamplesTests
 +{
-+    // The observed free respawn screen, not a food-selection revive dialog.
-+    internal static bool IsColdDefeat(string text)
++    [Fact]
++    public void StaticFramesAreOnlyACueAndGapsOrPhaseChangesClearIt()
 +    {
-+        var compact = Regex.Replace(text, @"\s+", "");
-+        return compact.Contains("复苏", StringComparison.Ordinal)
-+            && compact.Contains("严寒", StringComparison.Ordinal)
-+            && (compact.Contains("寒冷环境", StringComparison.Ordinal)
-+                || (compact.Contains("积累至上限", StringComparison.Ordinal)
-+                    && compact.Contains("削减角色生命值", StringComparison.Ordinal)));
++        var samples = new AgentProgressSamples(); var pixels = new byte[32 * 18];
++        samples.Observe("route", 0, pixels);
++        var fast = samples.Observe("route", 100, pixels);
++        Assert.Equal(1, fast.Value<int>("sample_count"));
++        var slow = samples.Observe("route", 5000, pixels);
++        Assert.Equal(5, slow.Value<double>("similar_world_seconds"));
++        Assert.Equal(Newtonsoft.Json.Linq.JTokenType.Null, slow["enemy_hp_fraction"]!.Type);
++        Assert.Equal(0, samples.Observe("route", 30000, pixels).Value<double>("similar_world_seconds"));
++        samples.Observe("route", 35000, pixels);
++        Assert.Equal(0, samples.Observe("interact", 40000, pixels).Value<double>("similar_world_seconds"));
++        Assert.Equal(0, samples.Observe("interact", 45000, Enumerable.Repeat((byte)200, 32 * 18).ToArray()).Value<double>("similar_world_seconds"));
++    }
++    [Fact]
++    public void RecoveryCatalogAlwaysRequiresCurrentGroundAndNeverOffersRawKeys()
++    {
++        var options = AgentRecoveryActions.Catalog(); Assert.Equal(16, options.Count);
++        Assert.Equal(16, options.Select(o => o.Value<string>("id")).Distinct().Count());
++        foreach (var option in options)
++        {
++            Assert.Equal("daily.recover", option.Value<string>("skill"));
++            Assert.True(option["preconditions"]!.Value<bool>("daily_recovery_grounded"));
++            Assert.True(option["preconditions"]!.Value<bool>("foreground"));
++            Assert.True(option["preconditions"]!.Value<bool>("account_verified"));
++            Assert.False(option["preconditions"]!.Value<bool>("daily_needs_scan"));
++            Assert.Equal(2, ((Newtonsoft.Json.Linq.JObject)option["arguments"]!).Count);
++        }
 +    }
 +}
 diff --git a/Test/BetterGenshinImpact.AgentBridge.Tests/AgentRecoveryUiTests.cs b/Test/BetterGenshinImpact.AgentBridge.Tests/AgentRecoveryUiTests.cs
 new file mode 100644
+index 0000000..60fcfad
 --- /dev/null
 +++ b/Test/BetterGenshinImpact.AgentBridge.Tests/AgentRecoveryUiTests.cs
 @@ -0,0 +1,18 @@
@@ -1763,59 +4057,9 @@ new file mode 100644
 +    public void OnlyRecognizesObservedColdDefeat(string text, bool expected)
 +        => Assert.Equal(expected, AgentRecoveryUi.IsColdDefeat(text));
 +}
-diff --git a/BetterGenshinImpact/Service/Agent/AgentScriptInput.cs b/BetterGenshinImpact/Service/Agent/AgentScriptInput.cs
-new file mode 100644
---- /dev/null
-+++ b/BetterGenshinImpact/Service/Agent/AgentScriptInput.cs
-@@ -0,0 +1,46 @@
-+using System;
-+
-+namespace BetterGenshinImpact.Service.Agent;
-+
-+/// <summary>Per-command interaction timing and dialogue-entry evidence.</summary>
-+internal sealed class AgentScriptInput(
-+    Action<string> press, Action<string> down, Action<string> up,
-+    Action<int> wait, Func<bool> isDialogue, bool requireDialogue)
-+{
-+    private bool _interactionAttempted;
-+    private bool _dialogueObserved;
-+
-+    internal void Press(string key)
-+    {
-+        ObserveDialogue();
-+        if (!key.Equals("F", StringComparison.OrdinalIgnoreCase)
-+            && !key.Equals("VK_F", StringComparison.OrdinalIgnoreCase))
-+        {
-+            press(key);
-+            return;
-+        }
-+
-+        _interactionAttempted = true;
-+        // A down/up pair in one SendInput batch may be missed by a game frame.
-+        // Always release even if cancellation arrives while the key is held.
-+        down(key);
-+        try { wait(100); }
-+        finally { up(key); }
-+        wait(400);
-+        ObserveDialogue();
-+    }
-+
-+    private void ObserveDialogue()
-+    {
-+        if (requireDialogue && !_dialogueObserved && isDialogue())
-+            _dialogueObserved = true;
-+    }
-+
-+    internal void VerifyDialogue()
-+    {
-+        ObserveDialogue();
-+        if (requireDialogue && _interactionAttempted && !_dialogueObserved)
-+            throw new InvalidOperationException(
-+                "Talk commission attempted interaction but never entered a verified dialogue view.");
-+    }
-+}
 diff --git a/Test/BetterGenshinImpact.AgentBridge.Tests/AgentScriptInputTests.cs b/Test/BetterGenshinImpact.AgentBridge.Tests/AgentScriptInputTests.cs
 new file mode 100644
+index 0000000..1255376
 --- /dev/null
 +++ b/Test/BetterGenshinImpact.AgentBridge.Tests/AgentScriptInputTests.cs
 @@ -0,0 +1,47 @@
@@ -1866,270 +4110,9 @@ new file mode 100644
 +        input.VerifyDialogue();
 +    }
 +}
-diff --git a/BetterGenshinImpact/Service/Agent/AgentVideoRecorder.cs b/BetterGenshinImpact/Service/Agent/AgentVideoRecorder.cs
-new file mode 100644
---- /dev/null
-+++ b/BetterGenshinImpact/Service/Agent/AgentVideoRecorder.cs
-@@ -0,0 +1,157 @@
-+using System;
-+using System.Diagnostics;
-+using System.IO;
-+using System.Security.Cryptography;
-+using System.Threading;
-+using System.Threading.Tasks;
-+using Newtonsoft.Json.Linq;
-+using OpenCvSharp;
-+
-+namespace BetterGenshinImpact.Service.Agent;
-+
-+/// <summary>Game frames only, no audio/input. Finalize independent one-minute clips.</summary>
-+internal sealed class AgentVideoRecorder(string directory, Func<Mat> capture) : IAsyncDisposable
-+{
-+    private const int Fps = 10;
-+    private readonly CancellationTokenSource _stop = new();
-+    private readonly JArray _clips = new();
-+    private Task? _task;
-+    private readonly object _gate = new();
-+    private readonly DateTimeOffset _started = DateTimeOffset.UtcNow;
-+    private long _frames;
-+    private string? _error;
-+    internal event Action? Failed;
-+
-+    internal void Start()
-+    {
-+        lock (_gate)
-+        {
-+            if (_task != null) return;
-+            Directory.CreateDirectory(directory);
-+            _task = Task.Run(RecordAsync);
-+        }
-+    }
-+
-+    private void Status(string status)
-+    {
-+        var value = new JObject
-+        {
-+            ["schema_version"] = 1, ["status"] = status, ["source"] = "bettergi_game_window",
-+            ["audio"] = false, ["fps"] = Fps, ["width"] = 1280, ["height"] = 720,
-+            ["started_at"] = _started, ["updated_at"] = DateTimeOffset.UtcNow,
-+            ["frames"] = _frames, ["clips"] = _clips.DeepClone(), ["error_type"] = _error
-+        };
-+        var path = Path.Combine(directory, "recording.json");
-+        File.WriteAllText(path + ".tmp", value.ToString());
-+        File.Move(path + ".tmp", path, true);
-+    }
-+
-+    private async Task RecordAsync()
-+    {
-+        VideoWriter? writer = null;
-+        string? path = null;
-+        var framesInClip = 0;
-+        var clipStarted = DateTimeOffset.UtcNow;
-+        var clock = Stopwatch.StartNew();
-+        var nextFrame = TimeSpan.Zero;
-+        var status = "stopped";
-+        try
-+        {
-+            using var timeline = new StreamWriter(Path.Combine(directory, "timeline.jsonl"), false);
-+            while (!_stop.IsCancellationRequested && !File.Exists(Path.Combine(directory, "stop")))
-+            {
-+                if (clock.Elapsed > TimeSpan.FromHours(2))
-+                    throw new TimeoutException("Recording lifetime exceeded.");
-+                if (writer == null)
-+                {
-+                    path = Path.Combine(directory, $"game-{_clips.Count + 1:D4}.mp4");
-+                    if (File.Exists(path)) throw new IOException("Recording file already exists.");
-+                    writer = new VideoWriter(path, VideoCaptureAPIs.FFMPEG,
-+                        VideoWriter.FourCC('m', 'p', '4', 'v'), Fps, new Size(1280, 720));
-+                    if (!writer.IsOpened()) throw new IOException("Video encoder could not start.");
-+                    framesInClip = 0;
-+                    clipStarted = DateTimeOffset.UtcNow;
-+                }
-+                using var raw = capture();
-+                if (raw.Empty()) throw new InvalidDataException("Empty game capture.");
-+                using var bgr = new Mat();
-+                if (raw.Channels() == 4) Cv2.CvtColor(raw, bgr, ColorConversionCodes.BGRA2BGR);
-+                else if (raw.Channels() == 3) raw.CopyTo(bgr);
-+                else throw new InvalidDataException("Unexpected game capture format.");
-+                using var frame = new Mat();
-+                Cv2.Resize(bgr, frame, new Size(1280, 720));
-+                writer.Write(frame);
-+                framesInClip++;
-+                _frames++;
-+                if (_frames % Fps == 1)
-+                {
-+                    timeline.WriteLine(new JObject { ["frame"] = _frames,
-+                        ["at"] = DateTimeOffset.UtcNow, ["elapsed_ms"] = clock.ElapsedMilliseconds }.ToString(Newtonsoft.Json.Formatting.None));
-+                    timeline.Flush();
-+                    Status("recording");
-+                }
-+                if (framesInClip >= Fps * 60)
-+                {
-+                    writer.Dispose();
-+                    writer = null;
-+                    FinalizeClip(path!, framesInClip, clipStarted);
-+                }
-+                nextFrame += TimeSpan.FromSeconds(1.0 / Fps);
-+                // Never burst-capture to conceal a stall. The timeline preserves timing gaps.
-+                if (nextFrame < clock.Elapsed) nextFrame = clock.Elapsed;
-+                var delay = nextFrame - clock.Elapsed;
-+                await Task.Delay(delay > TimeSpan.Zero ? delay : TimeSpan.Zero, _stop.Token).ConfigureAwait(false);
-+            }
-+        }
-+        catch (OperationCanceledException) when (_stop.IsCancellationRequested) { }
-+        catch (Exception error)
-+        {
-+            _error = error.GetType().Name;
-+            status = "failed";
-+        }
-+        finally
-+        {
-+            try
-+            {
-+                if (writer != null)
-+                {
-+                    writer.Dispose();
-+                    if (framesInClip > 0) FinalizeClip(path!, framesInClip, clipStarted);
-+                }
-+            }
-+            catch (Exception error) { _error = error.GetType().Name; status = "failed"; }
-+            try { Status(status); } catch (IOException) { /* Never impede input release. */ }
-+            if (status == "failed") Failed?.Invoke();
-+        }
-+    }
-+
-+    private void FinalizeClip(string path, int frames, DateTimeOffset started)
-+    {
-+        // Verify a finalized container, including the last frame, before claiming a clip.
-+        using var reader = new VideoCapture(path, VideoCaptureAPIs.FFMPEG);
-+        using var decoded = new Mat();
-+        if (!reader.IsOpened() || !reader.Read(decoded) || decoded.Empty()
-+            || !reader.Set(VideoCaptureProperties.PosFrames, frames - 1)
-+            || !reader.Read(decoded) || decoded.Empty())
-+            throw new InvalidDataException("Finalized video could not be decoded.");
-+        using var stream = File.OpenRead(path);
-+        _clips.Add(new JObject { ["path"] = Path.GetFileName(path), ["frames"] = frames,
-+            ["started_at"] = started, ["ended_at"] = DateTimeOffset.UtcNow,
-+            ["duration_seconds"] = frames / (double)Fps, ["bytes"] = stream.Length,
-+            ["sha256"] = Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant(),
-+            ["decode_verified"] = true });
-+    }
-+
-+    public async ValueTask DisposeAsync()
-+    {
-+        _stop.Cancel();
-+        Task? task;
-+        lock (_gate) task = _task;
-+        if (task != null)
-+        {
-+            try { await task.WaitAsync(TimeSpan.FromSeconds(10)).ConfigureAwait(false); }
-+            catch (TimeoutException) { return; } // Keep the worker's CTS alive until process exit.
-+        }
-+        _stop.Dispose();
-+    }
-+}
-diff --git a/Test/BetterGenshinImpact.AgentBridge.Tests/AgentVideoRecorderTests.cs b/Test/BetterGenshinImpact.AgentBridge.Tests/AgentVideoRecorderTests.cs
-new file mode 100644
---- /dev/null
-+++ b/Test/BetterGenshinImpact.AgentBridge.Tests/AgentVideoRecorderTests.cs
-@@ -0,0 +1,53 @@
-+using BetterGenshinImpact.Service.Agent;
-+using Newtonsoft.Json.Linq;
-+using OpenCvSharp;
-+using Xunit;
-+
-+public class AgentVideoRecorderTests
-+{
-+    [Theory]
-+    [InlineData(false)]
-+    [InlineData(true)]
-+    public async Task FinalizesDecodableVideoOnStopOrCaptureFailure(bool fail)
-+    {
-+        // Synthetic encoder/lifecycle test, never real gameplay acceptance evidence.
-+        var directory = Path.Combine(Path.GetTempPath(), "startlux-video-" + Guid.NewGuid());
-+        var captures = 0;
-+        await using var video = new AgentVideoRecorder(directory, () =>
-+        {
-+            if (Interlocked.Increment(ref captures) > 3 && fail)
-+                throw new InvalidOperationException("synthetic capture failure");
-+            return new Mat(72, 128, MatType.CV_8UC3, new Scalar(20, 120, 200));
-+        });
-+        var failures = 0;
-+        video.Failed += () => Interlocked.Increment(ref failures);
-+        video.Start();
-+        var deadline = DateTime.UtcNow.AddSeconds(15);
-+        while (Volatile.Read(ref captures) < 4 && DateTime.UtcNow < deadline) await Task.Delay(50);
-+        Assert.True(captures >= 4);
-+        if (!fail) File.WriteAllText(Path.Combine(directory, "stop"), "");
-+        JObject? metadata = null;
-+        while (DateTime.UtcNow < deadline)
-+        {
-+            var path = Path.Combine(directory, "recording.json");
-+            if (File.Exists(path))
-+            {
-+                metadata = JObject.Parse(File.ReadAllText(path));
-+                if (metadata.Value<string>("status") is "stopped" or "failed") break;
-+            }
-+            await Task.Delay(50);
-+        }
-+        Assert.Equal(fail ? "failed" : "stopped", metadata?.Value<string>("status"));
-+        var clip = Assert.Single((JArray)metadata!["clips"]!);
-+        Assert.True(clip.Value<bool>("decode_verified"));
-+        Assert.True(clip.Value<int>("frames") >= 3);
-+        Assert.True(new FileInfo(Path.Combine(directory, clip.Value<string>("path")!)).Length > 100);
-+        // The failure callback stops the native input lease, independently of the model request.
-+        if (fail)
-+        {
-+            while (Volatile.Read(ref failures) == 0 && DateTime.UtcNow < deadline) await Task.Delay(10);
-+            Assert.Equal(1, failures);
-+        }
-+        else Assert.Equal(0, failures);
-+    }
-+}
-diff --git a/BetterGenshinImpact/Service/Agent/AgentTimedRoutePolicy.cs b/BetterGenshinImpact/Service/Agent/AgentTimedRoutePolicy.cs
-new file mode 100644
---- /dev/null
-+++ b/BetterGenshinImpact/Service/Agent/AgentTimedRoutePolicy.cs
-@@ -0,0 +1,37 @@
-+using System;
-+using System.Text.RegularExpressions;
-+
-+namespace BetterGenshinImpact.Service.Agent;
-+
-+/// <summary>Bounded model-selected behavior for Full Speed Ahead only.</summary>
-+internal static class AgentTimedRoutePolicy
-+{
-+    internal static int Validate(int threshold) => threshold == 0
-+        ? threshold : throw new ArgumentOutOfRangeException(nameof(threshold));
-+
-+    internal static int? RemainingSeconds(string text)
-+    {
-+        var compact = Regex.Replace(text, @"\s+", "");
-+        // A clock or ability cooldown alone cannot enable the route override.
-+        if (!(compact.Contains("击败魔物", StringComparison.Ordinal)
-+                || compact.Contains("消灭魔物", StringComparison.Ordinal))
-+            || !compact.Contains("时间", StringComparison.Ordinal)
-+            || !compact.Contains("中断挑战", StringComparison.Ordinal))
-+            return null;
-+        var labelled = Regex.Match(compact, @"剩余时间[:：](\d{1,3})秒");
-+        int? seconds = labelled.Success ? int.Parse(labelled.Groups[1].Value) : null;
-+        var clock = Regex.Match(text, @"(?<!\d)([0-2]):([0-5]\d)(?!\d)");
-+        // Also accept the observed 00:29 form, retaining exact timer syntax.
-+        if (!clock.Success) clock = Regex.Match(text, @"(?<!\d)(0[0-2]):([0-5]\d)(?!\d)");
-+        if (clock.Success)
-+        {
-+            var clockSeconds = int.Parse(clock.Groups[1].Value) * 60 + int.Parse(clock.Groups[2].Value);
-+            if (seconds.HasValue && Math.Abs(seconds.Value - clockSeconds) > 1) return null;
-+            seconds ??= clockSeconds;
-+        }
-+        return seconds is > 0 and <= 180 ? seconds : null;
-+    }
-+
-+    internal static bool SkipFight(int threshold, int? seconds)
-+        => Validate(threshold) > 0 && seconds is > 0 && seconds <= threshold;
-+}
 diff --git a/Test/BetterGenshinImpact.AgentBridge.Tests/AgentTimedRoutePolicyTests.cs b/Test/BetterGenshinImpact.AgentBridge.Tests/AgentTimedRoutePolicyTests.cs
 new file mode 100644
+index 0000000..c739b38
 --- /dev/null
 +++ b/Test/BetterGenshinImpact.AgentBridge.Tests/AgentTimedRoutePolicyTests.cs
 @@ -0,0 +1,47 @@
@@ -2180,355 +4163,294 @@ new file mode 100644
 +        Assert.Throws<ArgumentOutOfRangeException>(() => AgentTimedRoutePolicy.Validate(120));
 +    }
 +}
-diff --git a/BetterGenshinImpact/Core/Config/PathingPartyConfig.cs b/BetterGenshinImpact/Core/Config/PathingPartyConfig.cs
---- a/BetterGenshinImpact/Core/Config/PathingPartyConfig.cs
-+++ b/BetterGenshinImpact/Core/Config/PathingPartyConfig.cs
-@@ -40,6 +40,17 @@
- 
-     [JsonIgnore]
-     public bool SkipPartySwitch { get; set; }
-+
-+    // Runtime-only override for timed tasks; never changes persisted user settings.
-+    [JsonIgnore]
-+    public bool SuppressOptionalBattleLoot { get; set; }
-+
-+    // Per-command pinned daily route, never a persisted user preference.
-+    [JsonIgnore]
-+    public bool VerifiedCommissionCombat { get; set; }
-+
-+    [JsonIgnore]
-+    public int TimedRouteSkipCombatBelowSeconds { get; set; }
-     
-     // 切换队伍前是否前往须弥七天神像
-     [ObservableProperty]
-diff --git a/BetterGenshinImpact/GameTask/AutoPathing/PathExecutor.cs b/BetterGenshinImpact/GameTask/AutoPathing/PathExecutor.cs
-index 5be50ff..00c8e52 100644
---- a/BetterGenshinImpact/GameTask/AutoPathing/PathExecutor.cs
-+++ b/BetterGenshinImpact/GameTask/AutoPathing/PathExecutor.cs
-@@ -1,4 +1,5 @@
- using BetterGenshinImpact.Core.Input;
-+using BetterGenshinImpact.Service.Agent;
- using BetterGenshinImpact.Core.Config;
- using BetterGenshinImpact.GameTask.AutoFight.Assets;
- using BetterGenshinImpact.GameTask.AutoFight.Model;
-@@ -252,6 +253,7 @@ public partial class PathExecutor
-                 }
-                 catch (HandledException handledException)
-                 {
-+                    if (PartyConfig.VerifiedCommissionCombat) throw;
-                     SuccessEnd = true;
-                     break;
-                 }
-@@ -284,11 +286,19 @@ public partial class PathExecutor
-                 }
-                 catch (RetryException retryException)
-                 {
-+                    // Recovery may teleport to another region. Never walk the old
-+                    // no-teleport route from the statue or skip its prerequisite actions.
-+                    if (PartyConfig.VerifiedCommissionCombat)
-+                        throw new InvalidOperationException("commission_route_recovery_requires_restart", retryException);
-                     StartSkipOtherOperations();
-                     Logger.LogWarning(retryException.Message);
-                 }
-                 catch (RetryNoCountException retryException)
-                 {
-+                    // Recovery may teleport to another region. Never walk the old
-+                    // no-teleport route from the statue or skip its prerequisite actions.
-+                    if (PartyConfig.VerifiedCommissionCombat)
-+                        throw new InvalidOperationException("commission_route_recovery_requires_restart", retryException);
-                     //特殊情况下，重试不消耗次数
-                     i--;
-                     StartSkipOtherOperations();
-@@ -476,10 +486,17 @@ public partial class PathExecutor
-         // 必须放在这里，因为要通过队伍识别来得到最终结果
-         var pathingConditionConfig = TaskContext.Instance().Config.PathingConditionConfig;
-         var skipPartySwitch = PartyConfig.SkipPartySwitch;
-+        var suppressOptionalBattleLoot = PartyConfig.SuppressOptionalBattleLoot;
-+        var verifiedCommissionCombat = PartyConfig.VerifiedCommissionCombat;
-+        var timedRouteSkipCombatBelowSeconds = PartyConfig.TimedRouteSkipCombatBelowSeconds;
-         if (PartyConfig is { Enabled: false })
-         {
-             PartyConfig = pathingConditionConfig.BuildPartyConfigByCondition(_combatScenes);
-             PartyConfig.SkipPartySwitch = skipPartySwitch;
-+            // 条件配置重建后仍保留本次限时路线的运行时限制。
-+            PartyConfig.SuppressOptionalBattleLoot = suppressOptionalBattleLoot;
-+            PartyConfig.VerifiedCommissionCombat = verifiedCommissionCombat;
-+            PartyConfig.TimedRouteSkipCombatBelowSeconds = timedRouteSkipCombatBelowSeconds;
-         }
- 
-         // 校验角色是否存在
-@@ -775,6 +792,7 @@ public partial class PathExecutor
-         // 连续偏角>5°持续状态的起始时间（配合帧数下限使用，替代原纯帧计数）
-         DateTime beyondAngleStartTime = DateTime.MinValue;
-         var hurryOnState = new HurryOnState();
-+        var flightInput = new AgentFlightInput();
- 
-         // 按下w，一直走
-         InputHub.Foreground.SimulateAction(GIActions.MoveForward, KeyType.KeyDown);
-@@ -887,6 +905,11 @@ public partial class PathExecutor
-                             await _trapEscaper.RotateAndMove();
-                             await _trapEscaper.MoveTo(waypoint);
-                             InputHub.Foreground.SimulateAction(GIActions.MoveForward, KeyType.KeyDown);
-+                            // Recovery changes both position and orientation. Give normal
-+                            // traversal a fresh sampling window; old samples otherwise
-+                            // trigger another recovery immediately and exhaust the budget.
-+                            prevPositions.Clear();
-+                            lastPositionRecord = DateTime.UtcNow;
-                             Logger.LogInformation("卡死脱离结束");
-                             continue;
-                         }
-@@ -927,7 +950,8 @@ public partial class PathExecutor
-             }
- 
-             // 赶路逻辑（使用角色技能加速赶路）
--            var hurryOnResult = await TryHurryOnAsync(diff, waypoint, distance, screen, num, hurryOnState);
-+            var hurryOnResult = !(PartyConfig.VerifiedCommissionCombat && waypoint.MoveMode == MoveModeEnum.Fly.Code)
-+                && await TryHurryOnAsync(diff, waypoint, distance, screen, num, hurryOnState);
-             if (hurryOnResult)
-             {
-                 // continue 会跳过底部 await Delay(...)，
-@@ -940,8 +964,21 @@ public partial class PathExecutor
-             // 根据指定方式进行移动
-             if (waypoint.MoveMode == MoveModeEnum.Fly.Code)
-             {
--                var isFlying = Bv.GetMotionStatus(screen) == MotionStatus.Fly;
--                if (!isFlying)
-+                // Rotation/skills may have changed the scene since the loop capture.
-+                using var flightScreen = CaptureToRectArea();
-+                var isFlying = Bv.GetMotionStatus(flightScreen) == MotionStatus.Fly;
-+                if (PartyConfig.VerifiedCommissionCombat)
-+                {
-+                    if (flightInput.ShouldOpen(isFlying, Environment.TickCount64))
-+                    {
-+                        Logger.LogInformation("委托飞行：发送跨帧开翼按键");
-+                        await AgentFlightInput.Pulse(
-+                            () => InputHub.Foreground.SimulateAction(GIActions.Jump, KeyType.KeyDown),
-+                            () => InputHub.Foreground.SimulateAction(GIActions.Jump, KeyType.KeyUp),
-+                            Delay, ct);
-+                    }
-+                }
-+                else if (!isFlying)
-                 {
-                     Debug.WriteLine("未进入飞行状态，按下空格");
-                     InputHub.Foreground.SimulateAction(GIActions.Jump);
-@@ -1125,7 +1162,7 @@ public partial class PathExecutor
-     {
-         if (waypoint.MoveMode == MoveModeEnum.Fly.Code && waypoint.Action == ActionEnum.StopFlying.Code)
-         {
--            await ActionFactory.GetBeforeHandler(ActionEnum.StopFlying.Code).RunAsync(ct, waypoint);
-+            await ActionFactory.GetBeforeHandler(ActionEnum.StopFlying.Code).RunAsync(ct, waypoint, PartyConfig);
-         }
-     }
- 
-diff --git a/BetterGenshinImpact/GameTask/AutoFight/AutoFightParam.cs b/BetterGenshinImpact/GameTask/AutoFight/AutoFightParam.cs
---- a/BetterGenshinImpact/GameTask/AutoFight/AutoFightParam.cs
-+++ b/BetterGenshinImpact/GameTask/AutoFight/AutoFightParam.cs
-@@ -41,6 +41,7 @@
-     public string CombatStrategyPath { get; set; }
- 
-     public bool FightFinishDetectEnabled { get; set; } = false;
-+    public bool RequireFightCompletion { get; set; } = false;
-     public bool PickDropsAfterFightEnabled { get; set; } = true;
-     public int PickDropsAfterFightSeconds { get; set; } = 15;
-     public int BattleThresholdForLoot { get; set; } = -1;
-diff --git a/BetterGenshinImpact/GameTask/AutoFight/AutoFightTask.cs b/BetterGenshinImpact/GameTask/AutoFight/AutoFightTask.cs
---- a/BetterGenshinImpact/GameTask/AutoFight/AutoFightTask.cs
-+++ b/BetterGenshinImpact/GameTask/AutoFight/AutoFightTask.cs
-@@ -529,6 +529,8 @@
- 
-         try
-         {
-+            if (_taskParam.RequireFightCompletion && timeOutFlag)
-+                throw new TimeoutException("必需战斗未确认结束，不能继续委托路线");
-             // 基于经验值检测结果的拾取判断
-             if (_taskParam.KazuhaPickupEnabled && _taskParam.ExpBasedPickupEnabled && expDetector != null)
-             {
-diff --git a/BetterGenshinImpact/GameTask/AutoPathing/Handler/AutoFightHandler.cs b/BetterGenshinImpact/GameTask/AutoPathing/Handler/AutoFightHandler.cs
---- a/BetterGenshinImpact/GameTask/AutoPathing/Handler/AutoFightHandler.cs
-+++ b/BetterGenshinImpact/GameTask/AutoPathing/Handler/AutoFightHandler.cs
-@@ -8,6 +8,8 @@
- using System.Threading.Tasks;
- using BetterGenshinImpact.GameTask.AutoPathing.Model;
- using Microsoft.Extensions.Logging;
-+using BetterGenshinImpact.Service.Agent;
-+using BetterGenshinImpact.Core.Recognition.OCR;
- 
- namespace BetterGenshinImpact.GameTask.AutoPathing.Handler;
- 
-@@ -26,6 +28,16 @@
- 
-     private async Task StartFight(CancellationToken ct, object? config = null , WaypointForTrack? waypointForTrack = null)
-     {
-+        ct.ThrowIfCancellationRequested();
-+        if (config is PathingPartyConfig { SuppressOptionalBattleLoot: true } timed)
-+        {
-+            AgentTimedRoutePolicy.Validate(timed.TimedRouteSkipCombatBelowSeconds);
-+            using var capture = TaskControl.CaptureToRectArea();
-+            var seconds = AgentTimedRoutePolicy.RemainingSeconds(OcrFactory.Paddle.Ocr(capture.SrcMat));
-+            ct.ThrowIfCancellationRequested();
-+            _logger.LogInformation("限时计时器检查：剩余 {Seconds} 秒；必须清除此处魔物，禁止跳过战斗",
-+                seconds);
-+        }
-         TaskControl.Logger.LogInformation("执行 {Text}", "自动战斗");
-         // 爷们要战斗
-         AutoFightParam taskParams = null;
-@@ -38,6 +50,23 @@
-         else
-         {
-             taskParams = new AutoFightParam(GetFightStrategy(), TaskContext.Instance().Config.AutoFightConfig);
-+        }
-+
-+        if (config is PathingPartyConfig { VerifiedCommissionCombat: true } or
-+            PathingPartyConfig { SuppressOptionalBattleLoot: true })
-+        {
-+            taskParams.FightFinishDetectEnabled = true;
-+            taskParams.RequireFightCompletion = true;
-+            taskParams.PickDropsAfterFightEnabled = false;
-+            taskParams.KazuhaPickupEnabled = false;
-+            taskParams.QinDoublePickUp = false;
-+            // The joined continuous targeting loop reacquires off-screen enemies.
-+            // Keep the legacy fire-and-forget movement seeker disabled here.
-+            taskParams.EnableCombatTargeting = true;
-+            taskParams.TargetingDetectionInterval = 100;
-+            taskParams.FinishDetectConfig.RotateFindEnemyEnabled = false;
-+            taskParams.FinishDetectConfig.SkipFightEndCheckWhenEnemyVisible = true;
-+            _logger.LogInformation("每日委托启用持续索敌、核验战斗结束并跳过可选拾取");
-         }
- 
-         //根据怪物标签，调整拾取配置
-diff --git a/BetterGenshinImpact/GameTask/AutoPathing/Handler/StopFlyingHandler.cs b/BetterGenshinImpact/GameTask/AutoPathing/Handler/StopFlyingHandler.cs
-index 5158712..c4bf5d1 100644
---- a/BetterGenshinImpact/GameTask/AutoPathing/Handler/StopFlyingHandler.cs
-+++ b/BetterGenshinImpact/GameTask/AutoPathing/Handler/StopFlyingHandler.cs
-@@ -1,4 +1,7 @@
- using BetterGenshinImpact.Core.Input;
-+using System;
-+using BetterGenshinImpact.Service.Agent;
-+using BetterGenshinImpact.Core.Config;
- using System.Threading;
- using System.Threading.Tasks;
- using BetterGenshinImpact.Core.Simulator.Extensions;
-@@ -13,6 +16,28 @@ public class StopFlyingHandler : IActionHandler
- {
-     public async Task RunAsync(CancellationToken ct, WaypointForTrack? waypointForTrack = null, object? config = null)
-     {
-+        if (config is PathingPartyConfig { VerifiedCommissionCombat: true })
-+        {
-+            // Do not blindly toggle SPACE twice. At low altitude that closes
-+            // the glider and can hit the ground before the attack is delivered.
-+            Logger.LogInformation("委托飞行：跨帧下落攻击，不执行自由落体窗口");
-+            await AgentFlightInput.Pulse(
-+                () => InputHub.Foreground.SimulateAction(GIActions.NormalAttack, KeyType.KeyDown),
-+                () => InputHub.Foreground.SimulateAction(GIActions.NormalAttack, KeyType.KeyUp),
-+                Delay, ct);
-+            var stable = 0;
-+            for (var sample = 0; sample < 50; sample++)
-+            {
-+                await Delay(100, ct);
-+                using var frame = CaptureToRectArea();
-+                var normal = Bv.IsInMainUi(frame) && Bv.GetMotionStatus(frame) == MotionStatus.Normal;
-+                stable = normal ? stable + 1 : 0;
-+                // The first missing flight hint is often an animation, not landing.
-+                if (sample >= 19 && stable >= 3) return;
-+            }
-+            throw new InvalidOperationException("commission_landing_not_observed");
-+        }
-+
-         // 如果有参数，先自由落体，然后恢复飞行
-         if (waypointForTrack != null
-             && !string.IsNullOrEmpty(waypointForTrack.ActionParams)
-diff --git a/BetterGenshinImpact/Service/Agent/AgentFlightInput.cs b/BetterGenshinImpact/Service/Agent/AgentFlightInput.cs
+diff --git a/Test/BetterGenshinImpact.AgentBridge.Tests/AgentUidRecognitionTests.cs b/Test/BetterGenshinImpact.AgentBridge.Tests/AgentUidRecognitionTests.cs
 new file mode 100644
-index 0000000..c67c327
+index 0000000..b3a2d96
 --- /dev/null
-+++ b/BetterGenshinImpact/Service/Agent/AgentFlightInput.cs
-@@ -0,0 +1,34 @@
-+using System;
-+using System.Threading;
-+using System.Threading.Tasks;
-+
-+namespace BetterGenshinImpact.Service.Agent;
-+
-+/// <summary>Frame-visible flight input with debounce; the UI hint is not a wing detector.</summary>
-+internal sealed class AgentFlightInput
-+{
-+    private long _lastPulse = long.MinValue;
-+    private int _missing;
-+    private bool _seenAirborne;
-+
-+    internal bool ShouldOpen(bool airborne, long milliseconds)
-+    {
-+        if (airborne) { _seenAirborne = true; _missing = 0; return false; }
-+        _missing++;
-+        if (_seenAirborne && _missing < 2) return false;
-+        if (_lastPulse != long.MinValue && milliseconds - _lastPulse < 700) return false;
-+        _lastPulse = milliseconds;
-+        _missing = 0;
-+        return true;
-+    }
-+
-+    internal static async Task Pulse(Action down, Action up, Func<int, CancellationToken, Task> delay,
-+        CancellationToken ct)
-+    {
-+        ct.ThrowIfCancellationRequested();
-+        try { down(); await delay(100, ct); }
-+        finally { up(); }
-+        // Input and captured frames lag the game. Never inspect the pre-input frame.
-+        await delay(300, ct);
-+    }
-+}
-diff --git a/Test/BetterGenshinImpact.AgentBridge.Tests/AgentFlightInputTests.cs b/Test/BetterGenshinImpact.AgentBridge.Tests/AgentFlightInputTests.cs
-new file mode 100644
-index 0000000..c045112
---- /dev/null
-+++ b/Test/BetterGenshinImpact.AgentBridge.Tests/AgentFlightInputTests.cs
-@@ -0,0 +1,49 @@
++++ b/Test/BetterGenshinImpact.AgentBridge.Tests/AgentUidRecognitionTests.cs
+@@ -0,0 +1,40 @@
 +using BetterGenshinImpact.Service.Agent;
 +using Xunit;
 +
-+namespace BetterGenshinImpact.AgentBridge.Tests;
-+
-+public class AgentFlightInputTests
++public class AgentUidRecognitionTests
 +{
-+    [Fact]
-+    public void MissingHintCannotRapidlyToggleGlider()
++    [Theory]
++    [InlineData("UID:123456789")]
++    [InlineData("Q\nE\nUD:123456789")]
++    [InlineData("U1D：123456789")]
++    [InlineData("U I D 123456789")]
++    public void FocusedBannerRetainsExactDigits(string text)
 +    {
-+        var input = new AgentFlightInput();
-+        Assert.True(input.ShouldOpen(false, 0));
-+        Assert.False(input.ShouldOpen(false, 300));
-+        Assert.False(input.ShouldOpen(true, 500));
-+        Assert.False(input.ShouldOpen(false, 1000)); // one bad frame
-+        Assert.True(input.ShouldOpen(false, 1200));
-+        Assert.False(input.ShouldOpen(false, 1300));
-+        Assert.False(input.ShouldOpen(true, 1500));
++        var result = AgentUidRecognition.Read(text, "");
++        Assert.Equal("123456789", result.AccountId);
++        Assert.Equal("bottom_right_ocr", result.Source);
 +    }
 +
-+    [Fact]
-+    public async Task PulseSpansFramesAndWaitsForFreshCapture()
-+    {
-+        var calls = new List<string>();
-+        await AgentFlightInput.Pulse(() => calls.Add("down"), () => calls.Add("up"),
-+            (ms, ct) => { calls.Add(ms.ToString()); return Task.CompletedTask; }, default);
-+        Assert.Equal(new[] { "down", "100", "up", "300" }, calls);
-+    }
++    [Theory]
++    [InlineData("123456789")]
++    [InlineData("UID:1234567")]
++    [InlineData("UID:12345678999")]
++    [InlineData("GUID:123456789")]
++    public void UnlabelledOrInvalidNumbersCannotVerifyAnAccount(string text)
++        => Assert.Null(AgentUidRecognition.Read(text, "").AccountId);
 +
 +    [Fact]
-+    public async Task CancellationReleasesHeldInput()
-+    {
-+        var calls = new List<string>();
-+        using var source = new CancellationTokenSource();
-+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => AgentFlightInput.Pulse(
-+            () => calls.Add("down"), () => calls.Add("up"),
-+            (ms, ct) => { source.Cancel(); ct.ThrowIfCancellationRequested(); return Task.CompletedTask; }, source.Token));
-+        Assert.Equal(new[] { "down", "up" }, calls);
-+    }
++    public void ConflictingFocusedBannersDoNotUseAConvenientFallback()
++        => Assert.Null(AgentUidRecognition.Read("UID:123456789\nUID:999999999", "UID:123456789").AccountId);
 +
 +    [Fact]
-+    public async Task AlreadyCancelledNeverPresses()
++    public void ActiveAccountBannerTakesPrecedenceOverAnotherProfileInTheFullFrame()
++        => Assert.Equal("123456789", AgentUidRecognition.Read("UID:123456789", "UID:999999999").AccountId);
++
++    [Fact]
++    public void FullFrameFallbackRequiresOneUnambiguousLabelledUid()
 +    {
-+        var calls = new List<string>();
-+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => AgentFlightInput.Pulse(
-+            () => calls.Add("down"), () => calls.Add("up"), Task.Delay, new CancellationToken(true)));
-+        Assert.Empty(calls);
++        Assert.Equal("full_frame_ocr", AgentUidRecognition.Read("", "UID:123456789").Source);
++        Assert.Null(AgentUidRecognition.Read("", "UID:123456789\nUID:999999999").AccountId);
++    }
++}
+diff --git a/Test/BetterGenshinImpact.AgentBridge.Tests/AgentVideoRecorderTests.cs b/Test/BetterGenshinImpact.AgentBridge.Tests/AgentVideoRecorderTests.cs
+new file mode 100644
+index 0000000..8226181
+--- /dev/null
++++ b/Test/BetterGenshinImpact.AgentBridge.Tests/AgentVideoRecorderTests.cs
+@@ -0,0 +1,55 @@
++using BetterGenshinImpact.Service.Agent;
++using Newtonsoft.Json.Linq;
++using OpenCvSharp;
++using Xunit;
++
++public class AgentVideoRecorderTests
++{
++    [Theory]
++    [InlineData(false)]
++    [InlineData(true)]
++    public async Task FinalizesDecodableVideoOnStopOrCaptureFailure(bool fail)
++    {
++        // Synthetic encoder/lifecycle test, never real gameplay acceptance evidence.
++        var directory = Path.Combine(Path.GetTempPath(), "startlux-video-" + Guid.NewGuid());
++        var captures = 0;
++        await using var video = new AgentVideoRecorder(directory, () =>
++        {
++            if (Interlocked.Increment(ref captures) > 3 && fail)
++                throw new AgentRecordingForegroundLostException();
++            return new Mat(72, 128, MatType.CV_8UC3, new Scalar(20, 120, 200));
++        });
++        var failures = 0;
++        video.Failed += () => Interlocked.Increment(ref failures);
++        video.Start();
++        var deadline = DateTime.UtcNow.AddSeconds(15);
++        while (Volatile.Read(ref captures) < 4 && DateTime.UtcNow < deadline) await Task.Delay(50);
++        Assert.True(captures >= 4);
++        if (!fail) File.WriteAllText(Path.Combine(directory, "stop"), "");
++        JObject? metadata = null;
++        while (DateTime.UtcNow < deadline)
++        {
++            var path = Path.Combine(directory, "recording.json");
++            if (File.Exists(path))
++            {
++                metadata = JObject.Parse(File.ReadAllText(path));
++                if (metadata.Value<string>("status") is "stopped" or "failed") break;
++            }
++            await Task.Delay(50);
++        }
++        Assert.Equal(fail ? "failed" : "stopped", metadata?.Value<string>("status"));
++        var clip = Assert.Single((JArray)metadata!["clips"]!);
++        Assert.True(clip.Value<bool>("decode_verified"));
++        Assert.True(clip.Value<int>("frames") >= 3);
++        Assert.True(new FileInfo(Path.Combine(directory, clip.Value<string>("path")!)).Length > 100);
++        // The failure callback stops the native input lease, independently of the model request.
++        if (fail)
++        {
++            Assert.Equal("game_foreground_lost", metadata.Value<string>("error_code"));
++            Assert.Equal("game_capture", metadata.Value<string>("error_stage"));
++            while (Volatile.Read(ref failures) == 0 && DateTime.UtcNow < deadline) await Task.Delay(10);
++            Assert.Equal(1, failures);
++        }
++        else Assert.Equal(0, failures);
++    }
++}
+diff --git a/Test/BetterGenshinImpact.AgentBridge.Tests/BetterGenshinImpact.AgentBridge.Tests.csproj b/Test/BetterGenshinImpact.AgentBridge.Tests/BetterGenshinImpact.AgentBridge.Tests.csproj
+new file mode 100644
+index 0000000..79dab82
+--- /dev/null
++++ b/Test/BetterGenshinImpact.AgentBridge.Tests/BetterGenshinImpact.AgentBridge.Tests.csproj
+@@ -0,0 +1,29 @@
++<Project Sdk="Microsoft.NET.Sdk">
++  <PropertyGroup>
++    <TargetFramework>net8.0</TargetFramework>
++    <ImplicitUsings>enable</ImplicitUsings>
++    <Nullable>enable</Nullable>
++    <IsTestProject>true</IsTestProject>
++    <IsPackable>false</IsPackable>
++  </PropertyGroup>
++  <ItemGroup>
++    <Compile Include="../../BetterGenshinImpact/Service/Agent/AgentResinBudget.cs" Link="AgentResinBudget.cs" />
++    <Compile Include="../../BetterGenshinImpact/Service/Agent/AgentGoalMemory.cs" Link="AgentGoalMemory.cs" />
++    <Compile Include="../../BetterGenshinImpact/Service/Agent/AgentRecoveryActions.cs" Link="AgentRecoveryActions.cs" />
++    <Compile Include="../../BetterGenshinImpact/Service/Agent/AgentProgressSamples.cs" Link="AgentProgressSamples.cs" />
++    <Compile Include="../../BetterGenshinImpact/Service/Agent/AgentGoalProgress.cs" Link="AgentGoalProgress.cs" />
++    <Compile Include="../../BetterGenshinImpact/Service/Agent/AgentCommissionReceipt.cs" Link="AgentCommissionReceipt.cs" />
++    <Compile Include="../../BetterGenshinImpact/Service/Agent/AgentFlightInput.cs" Link="AgentFlightInput.cs" />
++    <Compile Include="../../BetterGenshinImpact/Service/Agent/AgentUidRecognition.cs" Link="AgentUidRecognition.cs" />
++    <Compile Include="../../BetterGenshinImpact/Service/Agent/AgentJournalRows.cs" Link="AgentJournalRows.cs" />
++    <Compile Include="../../BetterGenshinImpact/Service/Agent/AgentRecoveryUi.cs" Link="AgentRecoveryUi.cs" />
++    <Compile Include="../../BetterGenshinImpact/Service/Agent/AgentScriptInput.cs" Link="AgentScriptInput.cs" />
++    <Compile Include="../../BetterGenshinImpact/Service/Agent/AgentTimedRoutePolicy.cs" Link="AgentTimedRoutePolicy.cs" />
++    <Compile Include="../../BetterGenshinImpact/Service/Agent/AgentVideoRecorder.cs" Link="AgentVideoRecorder.cs" />
++    <PackageReference Include="OpenCvSharp4.Windows" Version="4.11.0.20250507" />
++    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.8.0" />
++    <PackageReference Include="xunit" Version="2.5.3" />
++    <PackageReference Include="xunit.runner.visualstudio" Version="2.5.3" />
++    <ProjectReference Include="../../BetterGenshinImpact.AgentBridge/BetterGenshinImpact.AgentBridge.csproj" />
++  </ItemGroup>
++</Project>
+diff --git a/Test/BetterGenshinImpact.AgentBridge.Tests/ResinBudgetTests.cs b/Test/BetterGenshinImpact.AgentBridge.Tests/ResinBudgetTests.cs
+new file mode 100644
+index 0000000..50499ed
+--- /dev/null
++++ b/Test/BetterGenshinImpact.AgentBridge.Tests/ResinBudgetTests.cs
+@@ -0,0 +1,143 @@
++using BetterGenshinImpact.Service.Agent;
++using Newtonsoft.Json.Linq;
++using Xunit;
++
++public class ResinBudgetTests
++{
++    private static JObject Plan(int budget = 200) => new() { ["enabled"] = true, ["domain"] = "铭记之谷",
++        ["recommended_level"] = 90, ["stage"] = "钢铁之舞V", ["daily_budget"] = budget, ["resource"] = "original_only" };
++    private static JObject Scope(string day = "2026-10-22") => new() { ["account_id"] = "fixture", ["server_id"] = "fixture", ["game_day"] = day };
++    private static AgentResinBudget Open(string root, int limit = 200)
++    { var budget = new AgentResinBudget(root, Plan(limit)); budget.Bind(Scope()); return budget; }
++    private static string Root() => Path.Combine(Path.GetTempPath(), "resin-unit-" + Guid.NewGuid().ToString("N"));
++    [Fact] public void InterruptedReservationBlocksRestartAndChangedTarget()
++    {
++        var root = Root(); var budget = Open(root);
++        budget.Reserve(200, "run", "version");
++        var restored = Open(root);
++        Assert.True(restored.Blocked); Assert.Equal(0, restored.NextCost(200));
++        Assert.Throws<InvalidOperationException>(() => restored.Reserve(200, "run2", "v2"));
++    }
++    [Fact] public void OnlyTwoFailuresAcrossVersionsAndRestarts()
++    {
++        var root = Root(); var budget = Open(root);
++        var first = budget.Reserve(200, "run", "v1"); budget.Finish(first, "failed", new JObject());
++        budget = Open(root); Assert.False(budget.Blocked);
++        var second = budget.Reserve(200, "run2", "v2"); budget.Finish(second, "failed", new JObject());
++        Assert.True(Open(root).Blocked);
++    }
++    [Fact] public void UnknownClaimCannotBeRetriedOrOverwritten()
++    {
++        var budget = Open(Root()); var id = budget.Reserve(200, "run", "v1");
++        budget.Finish(id, "unknown", new JObject()); Assert.True(budget.Blocked);
++        Assert.Throws<InvalidOperationException>(() => budget.Finish(id, "failed", new JObject()));
++    }
++    [Fact] public void DeductionMustMatchAndBudgetPersists()
++    {
++        var root = Root(); var budget = Open(root, 40); var id = budget.Reserve(60, "run", "v1");
++        var proofs = new JObject { ["before"] = "a", ["selection"] = "b", ["claim"] = "c", ["reward"] = "d", ["after"] = "e" };
++        Assert.Throws<InvalidDataException>(() => budget.Finish(id, "verified", new JObject { ["after"] = 21, ["proofs"] = proofs }));
++        budget.Finish(id, "verified", new JObject { ["after"] = 20, ["proofs"] = proofs });
++        var restored = Open(root, 40); Assert.Equal(40, restored.Spent); Assert.Equal(0, restored.NextCost(20));
++    }
++    [Theory] [InlineData("原粹树脂 ×20",20)] [InlineData("原粹树脂40",40)]
++    [InlineData("原粹树脂",0)] [InlineData("浓缩树脂20",0)] [InlineData("原粹树脂20/40",0)] [InlineData("原粹树脂200",0)]
++    public void NeverDefaultsUnknownOrWrongCurrencyToTwenty(string text, int cost) => Assert.Equal(cost, AgentResinBudget.ReadCost(text));
++    [Theory] [InlineData("extra",true)] [InlineData("missing",false)] [InlineData("wrong_names",false)]
++    [InlineData("empty",false)] [InlineData("non_string",false)]
++    public void RequireNamedRewardEvidenceAndAllowAdditionalDiagnostics(string mode, bool valid)
++    {
++        var b = Open(Root()); var id = b.Reserve(200,"run","v");
++        var p = new JObject { ["before"]="a", ["selection"]="b", ["claim"]="c", ["reward"]="d", ["after"]="e" };
++        if (mode == "extra") p["entry_menu"]="f";
++        if (mode == "missing") p.Remove("reward");
++        if (mode == "wrong_names") { p.Remove("reward"); p["entry_menu"]="f"; }
++        if (mode == "empty") p["reward"]="";
++        if (mode == "non_string") p["reward"]=true;
++        var evidence = new JObject { ["after"]=160, ["proofs"]=p };
++        if (valid) { b.Finish(id,"verified",evidence); Assert.Equal(40,b.Spent); }
++        else { Assert.Throws<InvalidDataException>(() => b.Finish(id,"verified",evidence)); Assert.True(b.Blocked); }
++    }
++    [Theory] [InlineData(82,42,true)] [InlineData(null,42,false)] [InlineData(82,43,false)]
++    [InlineData(80,40,false)] [InlineData(201,161,false)] [InlineData(81,41,true)]
++    public void RegenerationNeedsFreshClaimBalanceAndExactDeduction(int? claimBefore,int after,bool valid)
++    {
++        var b=Open(Root());var id=b.Reserve(81,"run","v");
++        var e=new JObject { ["after"]=after, ["proofs"]=new JObject {
++            ["before"]="a",["selection"]="b",["claim"]="c",["reward"]="d",["after"]="e" } };
++        if (claimBefore != null) e["claim_before"]=claimBefore;
++        if (valid) { b.Finish(id,"verified",e); Assert.Equal(40,b.Spent); }
++        else { Assert.Throws<InvalidDataException>(()=>b.Finish(id,"verified",e)); Assert.True(b.Blocked); }
++    }
++    [Theory] [InlineData("200/200",200)] [InlineData("0/200",0)] [InlineData("180 / 200",180)]
++    [InlineData("2001200",null)] [InlineData("201/200",null)] [InlineData("20/200 40/200",null)] [InlineData("remaining 20",null)]
++    public void BalanceRequiresOneLiteralFraction(string text, int? expected) => Assert.Equal(expected, AgentResinBudget.ReadBalanceText(text));
++    [Theory] [InlineData("祝圣秘境: 钢铁之舞 V",true)] [InlineData("祝圣秘境：钢铁之舞Ⅴ",true)]
++    [InlineData("铭记之谷",false)] [InlineData("祝圣秘境：钢铁之舞IV",false)] [InlineData("祝圣秘境：钢铁之舞VI",false)]
++    public void BindActualStageTitleInsteadOfMapName(string observed, bool expected) => Assert.Equal(expected, AgentResinBudget.StageMatches(observed,"钢铁之舞V"));
++    [Theory] [InlineData("祝圣秘境: 钢铁之舞 V\nθ",true)]
++    [InlineData("祝圣秘境: 钢铁之舞 IV\nθ",false)] [InlineData("祝圣秘境: 钢铁之舞 VI\nθ",false)]
++    [InlineData("θ",false)] [InlineData("祝圣秘境: 钢铁之舞 V θ",false)]
++    [InlineData("祝圣秘境: 钢铁之舞 V\n祝圣秘境: 钢铁之舞 V",false)]
++    public void IgnoreSeparateInformationIconButRequireOneExactSelectedTitle(string observed, bool expected)
++        => Assert.Equal(expected, AgentResinBudget.SelectedStageMatches(observed,"钢铁之舞V"));
++    [Fact] public void CorruptedHistoryFailsClosed()
++    {
++        var root = Root(); var budget = Open(root); budget.Reserve(20, "run", "v1");
++        File.WriteAllText(Directory.GetFiles(root,"*.json").Single(), "{}");
++        Assert.Throws<InvalidDataException>(() => Open(root));
++    }
++    [Theory]
++    [InlineData("valid",false)] [InlineData("autonomous",true)] [InlineData("wrong_version",true)]
++    [InlineData("wrong_plan",true)] [InlineData("expired",true)] [InlineData("unknown",true)]
++    [InlineData("new_failure",true)] [InlineData("used",true)]
++    public void ExplicitDevelopmentRetryPreservesFailuresAndCannotHideAnotherFailure(string mode, bool blocked)
++    {
++        var root = Root(); var old = Open(root);
++        var first = old.Reserve(200,"first","old"); old.Finish(first,"failed",new JObject());
++        var second = old.Reserve(200,"second","old"); old.Finish(second,"failed",new JObject());
++        var grantId = new string('a',32);
++        var grant = new JObject { ["id"] = grantId, ["origin"] = "explicit_operator_development_retry",
++            ["scope"] = Scope(), ["plan"] = Plan(), ["version"] = "new", ["max_rounds"] = 1,
++            ["failed_attempt_ids"] = new JArray(first,second), ["expires_at"] = DateTimeOffset.UtcNow.AddHours(1).ToString("O") };
++        if (mode == "wrong_version") grant["version"] = "different";
++        if (mode == "wrong_plan") grant["plan"]!["recommended_level"] = 80;
++        if (mode == "expired") grant["expires_at"] = DateTimeOffset.UtcNow.AddMinutes(-1).ToString("O");
++        File.WriteAllText(Directory.GetFiles(root,"*.json").Single()+".retry.json",grant.ToString());
++        var budget = new AgentResinBudget(root,Plan(),"new",mode != "autonomous"); budget.Bind(Scope());
++        if (mode is "unknown" or "new_failure" or "used")
++        {
++            var id = budget.Reserve(200,"retry","new");
++            Assert.True(budget.Blocked); // In-flight reservation is always protected.
++            budget.Finish(id, mode == "unknown" ? "unknown" : mode == "new_failure" ? "failed" : "verified",
++                mode == "used" ? new JObject { ["after"] = 160, ["proofs"] = new JObject {
++                    ["before"]="a",["selection"]="b",["claim"]="c",["reward"]="d",["after"]="e" } } : new JObject());
++        }
++        Assert.Equal(blocked,budget.Blocked);
++        Assert.Equal(2,budget.Rows.Count(r => r.Value<string>("id") == first || r.Value<string>("id") == second));
++        Assert.Equal(mode == "used" ? 40 : 0,budget.Spent);
++        Assert.True(Open(root).Blocked); // A grant never affects autonomous operation.
++    }
++    [Theory] [InlineData(false)] [InlineData(true)]
++    public void ReachedSpendingCapIsCompleteButUnknownClaimsStillBlock(bool unknown)
++    {
++        var root=Root();var b=Open(root,40);
++        var first=b.Reserve(200,"first","old");b.Finish(first,"failed",new JObject());
++        var second=b.Reserve(200,"second","old");b.Finish(second,"failed",new JObject());
++        var file=Directory.GetFiles(root,"*.json").Single();
++        var grant=new JObject { ["id"]=new string('a',32),["origin"]="explicit_operator_development_retry",
++            ["scope"]=Scope(),["plan"]=Plan(40),["version"]="new",["max_rounds"]=1,
++            ["failed_attempt_ids"]=new JArray(first,second),["expires_at"]=DateTimeOffset.UtcNow.AddHours(1).ToString("O") };
++        File.WriteAllText(file+".retry.json",grant.ToString());
++        b=new AgentResinBudget(root,Plan(40),"new",true);b.Bind(Scope());
++        var id=b.Reserve(200,"last","new");b.Finish(id,"verified",new JObject { ["after"]=160,
++            ["proofs"]=new JObject { ["before"]="a",["selection"]="b",["claim"]="c",["reward"]="d",["after"]="e" } });
++        if (unknown) {
++            var data=JObject.Parse(File.ReadAllText(file));
++            ((JArray)data["attempts"]!).Add(new JObject { ["id"]="ambiguous",["cost"]=20,["status"]="unknown" });
++            File.WriteAllText(file,data.ToString());
++        }
++        Assert.Equal(unknown,b.Blocked);Assert.Equal(0,b.NextCost(160));
++        Assert.Equal(unknown,Open(root,40).Blocked);Assert.Equal(40,b.Spent);
 +    }
 +}

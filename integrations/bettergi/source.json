@@ -3,7 +3,7 @@
   "base_commit": "b3f90e70494320639eeccc8c559612d02d2d9ef0",
   "local_development_commit": null,
   "patch_file": "startlux-agent-bridge.patch",
-  "patch_sha256": "a84965c817b4949e23d11210dc4c797d4a08e547f4ad61b887dc9f8ec2308d58",
+  "patch_sha256": "e36875ca3b89dc971ffa9bf7233f5eadff3186fb414b9cb33861492a68e7a089",
   "license": "GPL-3.0",
   "status": "development",
   "protocol_version": 1,
@@ -25,6 +25,15 @@
     "replace real account UID in OCR regression fixtures with synthetic digits for public distribution",
     "hold commission flight inputs across game frames with fresh capture and a glider-toggle cooldown",
     "remove blind freefall toggles before commission landing and require stable post-action observations",
-    "abort commission routes after recovery instead of resuming old coordinates from a different region"
+    "abort commission routes after recovery instead of resuming old coordinates from a different region",
+    "stop the selected commission after a fresh two-frame primogem receipt and require a new independent journal scan",
+    "retain recording failure stage and explicit foreground-loss diagnostics without recording other windows",
+    "recognize configured Paddle V6 primogem text without multiplication glyph and fresh central reward popup",
+    "Decision-directed execution review with frame-bound safe checkpoints and joined native cancellation",
+    "defer a commission after two independently verified incomplete attempts and keep other quests available",
+    "persist account/server/game-day quest reservations across restarts and versions, including interrupted attempts",
+    "offer bounded Decision-selected ranged, lateral repositioning and statue-heal retries within the daily two-attempt budget",
+    "provide phase duration, low-health and fixed-interval visual motion cues without inventing enemy health or target distance",
+    "bounded original-resin domain workload with frozen target, two-failure day budget, no refills/consumables and archived claim/deduction evidence"
   ]
 }

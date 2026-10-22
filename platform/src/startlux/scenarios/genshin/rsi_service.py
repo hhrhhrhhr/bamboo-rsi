@@ -148,6 +148,9 @@ class Coordinator:
             pointer = self.store.read("active.json")
             scope = configured_scope(self.config["account"], now)
             if not pointer.get("campaign_hash"):
+                resin = self.resin_cycle(scope)
+                if resin is not None:
+                    return resin
                 from .rsi_rehearsal import pending_rehearsal
                 rehearsal = pending_rehearsal(self, scope, now)
                 if rehearsal is not None:
@@ -164,6 +167,8 @@ class Coordinator:
                 for metadata_path in sorted((self.store.home / "runs").glob("*/attempt.json")):
                     path = metadata_path.parent
                     metadata = json.loads(metadata_path.read_bytes())
+                    if metadata.get("workload") == "resin":
+                        continue
                     if metadata.get("rsi_assignment", {}).get("bundle_hash") == active.identity:
                         if (metadata.get("state") != "ended" and metadata.get("execution_armed")
                                 and not has_stop_resolution(path)):
@@ -284,6 +289,32 @@ class Coordinator:
             "environment": environment(self.config),
             "development_training_days": self.config.get("development_training_days", []),
             "rejected_hypotheses": sorted({record["candidate_hash"] for record in rejections})}
+        feedback = []
+        # Explicit developer/user observations stay distinct from model evidence.
+        # Bind each note to a preserved training run; never expose a heldout day.
+        import re
+        for path in sorted((self.store.root / "operator-feedback").glob("*.json")):
+            value = json.loads(path.read_bytes())
+            run_id = value.get("run_id", "")
+            if (value.get("game_day") not in self.config.get("development_training_days", [])
+                    or not re.fullmatch(r"[a-zA-Z0-9_-]{1,128}", run_id)
+                    or not isinstance(value.get("observation"), str)
+                    or not 1 <= len(value["observation"]) <= 2000):
+                continue
+            run = self.store.home / "runs" / run_id
+            if run.is_symlink() or not run.resolve().is_relative_to((self.store.home / "runs").resolve()):
+                raise ValueError("feedback run escapes execution home")
+            metadata = json.loads((run / "attempt.json").read_bytes())
+            if ((metadata.get("observed_scope") or metadata.get("launch_scope", {})).get("game_day") != value["game_day"]
+                    or hashlib.sha256((run / "trace.jsonl").read_bytes()).hexdigest() != value.get("trace_sha256")):
+                raise ValueError("operator feedback is not bound to its historical run")
+            feedback.append({k: value[k] for k in ("run_id", "game_day", "trace_sha256", "observation")})
+        if feedback:
+            problem["operator_feedback"] = canonical_hash(feedback)
+        from .resin import training_feedback
+        resin_feedback = training_feedback(self.store.home, self.config.get("development_training_days", []))
+        if resin_feedback:
+            problem["resin_training_feedback"] = canonical_hash(resin_feedback)
         if backend == "codex_exec":
             problem["code_build_rejections"] = sorted({r["proposal_hash"] for r in code_failures})
             from .rsi_program import bundle_program
@@ -347,7 +378,8 @@ class Coordinator:
                 action = failure.get("action") or {}
                 prefix = str(action.get("arguments", {}).get("slot")) + ":"
                 quest_id = next((q for q in evidence.get("expected_quest_ids", []) if q.startswith(prefix)), None)
-                failures.append({**{k: failure.get(k) for k in ("code", "category", "decision", "action")},
+                failures.append({**{k: failure.get(k) for k in ("code", "category", "decision", "action",
+                                                               "error_type", "error_code", "elapsed_ms")},
                     "executed_bundle": executed_bundle, "quest_id": quest_id,
                     "game_day": (assessment.get("scope") or {}).get("game_day")})
             native = run / "native-diagnostics.txt"
@@ -364,6 +396,9 @@ class Coordinator:
             "id": identity, "problem_hash": problem_hash,
             "windows_output": str(directory / "output"), "failures": failures,
             "optimizer_backend": backend, "native_diagnostics": native_diagnostics[-3:],
+            "resin_training_feedback": [f for f in resin_feedback if f["game_day"] in training_days],
+            "operator_feedback": [{**f, "origin": "operator_assisted"} for f in feedback[-8:]
+                                  if f["game_day"] in training_days],
             "rejected_hypotheses": [self.store.bundle(record["candidate_hash"]).model_dump()
                 for record in rejections][-8:],
             "repair_combat": any(f["category"] == "execution" and (f.get("action") or {}).get("skill") == "daily.execute" for f in failures),
@@ -438,10 +473,38 @@ class Coordinator:
         if result.get("syntax_valid") is not True or result.get("game_execution") is not False:
             raise ValueError("native combat parser did not validate the candidate")
 
-    def launch(self, *, rehearsal=None):
+    def resin_cycle(self, scope):
+        from .resin import load_plan
+        from .assessment import assess_run
+        if self.store.read("active.json").get("campaign_hash"):
+            return None
+        plan = load_plan(self.store.home)
+        if not plan.enabled:
+            return None
+        reservation = self.store.root / "resin-days" / (canonical_hash(scope.model_dump()) + ".json")
+        if reservation.exists():
+            saved = json.loads(reservation.read_bytes())
+            if saved.get("status") == "reserved":
+                return self.status("attention_required", reason="resin_run_requires_reconciliation")
+            return None
+        if not any(meta.get("workload", "daily") == "daily" and assess_run(path)["game_complete"]
+                   for path, meta in self._attempts(scope)):
+            return None
+        if not self.has_input_privilege():
+            return self.status("admin_required", reason="resin_workload")
+        value = {"status": "reserved", "scope": scope.model_dump(), "plan": plan.model_dump(),
+                 "at": utc_now(), "run_mode": "development", "autonomous_evidence": False}
+        atomic_json(reservation, value)
+        self.status("running_resin", domain=plan.domain)
+        result = self.launcher(workload="resin")
+        atomic_json(reservation, {**value, "status": "finished", "result": result})
+        return self.status("resin_run_finished", result=result)
+
+    def launch(self, *, rehearsal=None, workload="daily"):
         root = Path(self.config["root"])
         worker = subprocess.Popen([sys.executable, str(root / "scripts/run_genshin_dev.py"),
-                                 "--run-mode", "development" if rehearsal else "autonomous",
+                                 "--run-mode", "development" if rehearsal or workload == "resin" else "autonomous",
+                                 "--workload", workload,
                                  *(["--rsi-rehearsal", rehearsal] if rehearsal else []),
                                  "--home", str(self.store.home), "--install", str(Path(self.config["host"]).parent)],
             cwd=root, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)

@@ -28,8 +28,8 @@ from .rsi_native import EDITABLE as NATIVE_EDITABLE, NativeStore
 ADAPTER = "integrations/auto_commission/agent-main.js"
 EDITABLE = frozenset({"scenarios/genshin/decision.py", "scenarios/genshin/runner.py",
                       "scenarios/genshin/supervisor.py", ADAPTER})
-CHECKS = ("test_genshin_autonomy.py", "test_genshin_checkpoint.py",
-          "test_genshin_thinking.py", "test_genshin_recording.py", "test_genshin_rsi.py",
+CHECKS = ("test_genshin_autonomy.py", "test_genshin_checkpoint.py", "test_genshin_recovery_actions.py",
+          "test_genshin_thinking.py", "test_genshin_recording.py", "test_genshin_resin.py", "test_genshin_rsi.py",
           "test_genshin_program.py", "test_genshin_native.py")
 BUILD_VERSION = 3
 

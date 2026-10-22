@@ -130,9 +130,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-mode", choices=["development", "autonomous"], default="development")
     parser.add_argument("--rsi-rehearsal")
+    parser.add_argument("--workload", choices=["daily", "resin"], default="daily")
+    parser.add_argument("--resin-retry-reason", help="Explicit development continuation after a changed version; preserves all prior failures")
     parser.add_argument("--home", type=Path)
     parser.add_argument("--install", type=Path)
     args = parser.parse_args()
+    if args.resin_retry_reason and (args.workload != "resin" or args.run_mode != "development"):
+        raise ValueError("Resin retry is development-only")
     if args.rsi_rehearsal and args.run_mode != "development":
         raise ValueError("rehearsal cannot be marked autonomous")
     if sys.platform != "win32" or not ctypes.windll.shell32.IsUserAnAdmin():
@@ -171,7 +175,8 @@ def main():
             from startlux.scenarios.genshin.rsi_program import ProgramStore, bundle_program, evaluator_hash
             store = RSIStore(home)
             config = json.loads(config_path.read_text(encoding="utf-8-sig"))
-            bundle = store.bundle(args.rsi_rehearsal) if args.rsi_rehearsal else store.assignment(configured_scope(config))[0]
+            bundle = store.bundle(args.rsi_rehearsal) if args.rsi_rehearsal else (
+                store.bundle(store.read("active.json")["bundle_hash"]) if args.workload == "resin" else store.assignment(configured_scope(config))[0])
             identity = bundle_program(home, bundle)
             programs = ProgramStore(home)
             manifest = programs.verify(identity)
@@ -202,7 +207,7 @@ def main():
                 (RUNTIME / "live-worker-stderr.log").open("w", encoding="utf-8") as stderr:
             worker = subprocess.Popen([*entry, "run",
                 "--config", str(config_path), "--pipe", pipe, "--assets", str(assets_path),
-                "--host-directory", str(host_directory), "--run-mode", args.run_mode,
+                "--host-directory", str(host_directory), "--run-mode", args.run_mode, "--workload", args.workload,
                 *(["--rsi-rehearsal", args.rsi_rehearsal] if args.rsi_rehearsal else [])],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr, encoding="utf-8", cwd=ROOT,
                 creationflags=subprocess.CREATE_NO_WINDOW)
@@ -236,6 +241,11 @@ def main():
                 log.write(json.dumps(event, ensure_ascii=False) + "\n")
                 if event.get("status") == "pack_ready":
                     run_directory = event["run_directory"]
+                    if args.resin_retry_reason:
+                        from startlux.scenarios.genshin.resin import grant_development_retry
+                        grant_development_retry(home, Path(run_directory),
+                            json.loads(Path(event["bridge_config"]).read_bytes()),
+                            configured_scope(config).model_dump(), args.resin_retry_reason)
                     environment = os.environ.copy()
                     environment["STARTLUX_AGENT_CONFIG"] = event["bridge_config"]
                     environment["STARTLUX_AGENT_PIPE"] = pipe

@@ -12,6 +12,7 @@ import uuid
 
 from .contracts import (ActionCommand, ActionResult, DecisionReceipt,
                         RealtimeDecisionProvider, RealtimeSession, catalog_hash)
+from .settings import TransientProviderError
 
 
 class AuditLog:
@@ -178,7 +179,10 @@ class ExecutionEngine:
         except Exception as error:
             # Error messages from third-party HTTP clients may include secrets.
             self._record("decision_or_execution_error", request_id=request_id,
-                         error_type=type(error).__name__)
+                         error_type=type(error).__name__,
+                         **({"error_code": error.code,
+                             "elapsed_ms": max(0, (self.clock() - started) * 1000)}
+                            if isinstance(error, TransientProviderError) else {}))
             self._stop_after_error()
             raise
 

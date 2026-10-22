@@ -17,7 +17,8 @@ from .episode import utc_now
 from .rsi_program import ADAPTER, EDITABLE, ProgramStore, bundle_program, clean_env, sha
 from .rsi_native import EDITABLE as NATIVE_EDITABLE, PREFIX as NATIVE_PREFIX, NativeStore
 
-PROPOSAL_PATHS = EDITABLE | NATIVE_EDITABLE
+COMBAT = "User/AutoFight/StartLux/bennett-ayaka-yelan-zhongli.txt"
+PROPOSAL_PATHS = EDITABLE | NATIVE_EDITABLE | {COMBAT}
 
 
 SCHEMA = {"type": "object", "additionalProperties": False,
@@ -40,7 +41,9 @@ def redact(value):
         return value
     text = value
     text = re.sub(r"(?:sk-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})", "[credential-redacted]", text)
-    text = re.sub(r"(?<!\d)\d{9,10}(?!\d)", "[account-redacted]", text)
+    # Account digits must not corrupt hexadecimal evidence/content hashes.
+    text = re.sub(r"(?<![A-Za-z0-9])([a-fA-F0-9]{64})(?![A-Za-z0-9])|(?<!\d)(\d{9,10})(?!\d)",
+                  lambda match: match.group(1) or "[account-redacted]", text)
     from pathlib import PureWindowsPath
     text = re.sub(r"[A-Za-z]:\\[^\r\n\"']+",
                   lambda m: "[local-path-redacted]/" + PureWindowsPath(m.group()).name, text)
@@ -62,6 +65,12 @@ def proposal_context(job, parent, programs):
         if path.is_file():
             references[name] = {"content": path.read_text(encoding="utf-8")[:18000], "editable": False}
     native_sources = {}
+    combat_sources = {}
+    if job.get("combat_baseline"):
+        from .rsi_combat import validate_combat
+        combat_text = parent.combat.script if parent.combat else job["combat_baseline"]["script"]
+        validate_combat(combat_text)
+        combat_sources[COMBAT] = {"sha256": sha(combat_text.encode("utf-8")), "content": combat_text}
     if manifest.get("native_program"):
         native = NativeStore(programs.home)
         value = native.verify(manifest["native_program"])
@@ -70,6 +79,8 @@ def proposal_context(job, parent, programs):
             for name in sorted(NATIVE_EDITABLE)}
         native_root = native.directory(manifest["native_program"]) / "source"
         for name in ("Test/BetterGenshinImpact.AgentBridge.Tests/AgentFlightInputTests.cs",
+                     "BetterGenshinImpact/Service/Agent/AgentResinSession.cs",
+                     "BetterGenshinImpact/Service/Agent/AgentResinBudget.cs",
                      "BetterGenshinImpact/GameTask/AutoPathing/PathExecutor.cs"):
             path = native_root / name
             if path.is_file():
@@ -83,10 +94,13 @@ def proposal_context(job, parent, programs):
             "sources": {**{name: {"sha256": manifest["resources"]["agent-main.js"] if name == ADAPTER else manifest["files"][name],
                                "content": ((programs.directory(identity) / "resources/agent-main.js")
                                            if name == ADAPTER else (source / name)).read_text(encoding="utf-8")}
-                        for name in sorted(EDITABLE)}, **native_sources},
+                        for name in sorted(EDITABLE)}, **native_sources, **combat_sources},
             "training_days": job["training_days"], "failures": redact(failures[-24:]),
             "failure_selection": "last_24_training_failures", "readonly_upstream_references": references,
             "native_diagnostics": redact(job.get("native_diagnostics", [])),
+            "resin_training_feedback": redact([f for f in job.get("resin_training_feedback", []) if f["game_day"] in job["training_days"]]),
+            "operator_feedback": redact([f for f in job.get("operator_feedback", [])
+                if f.get("game_day") in job["training_days"]]),
             "previous_rejections": redact(job.get("code_rejections", []))}
 
 
@@ -100,6 +114,37 @@ def terminate_owned(worker):
         import signal
         os.killpg(worker.pid, signal.SIGTERM)
     worker.wait(timeout=15)
+
+
+def validate_proposal_events(events, proposal):
+    """A recovered connection warning is not a failed turn or a valid patch."""
+    if (not events or events[-1].get("type") != "turn.completed"
+            or sum(e.get("type") == "turn.started" for e in events) != 1
+            or sum(e.get("type") == "turn.completed" for e in events) != 1):
+        raise ValueError("Codex did not complete one proposal turn")
+    recovered, messages = [], []
+    for index, event in enumerate(events):
+        kind = event.get("type")
+        if kind in {"thread.started", "turn.started", "turn.completed"}:
+            continue
+        if kind == "error" and re.fullmatch(r"Reconnecting\.\.\. \d+/\d+ \([^\r\n]{1,1000}\)", event.get("message", "")):
+            recovered.append({"event": index, "kind": "reconnect"})
+            continue
+        if kind in {"item.started", "item.updated", "item.completed"}:
+            item = event.get("item", {})
+            if (item.get("type") == "error" and kind == "item.completed"
+                    and re.fullmatch(r"Falling back from WebSockets to HTTPS transport\. [^\r\n]{1,1000}", item.get("message", ""))):
+                recovered.append({"event": index, "kind": "transport_fallback"})
+                continue
+            if item.get("type") in {"reasoning", "agent_message"}:
+                if kind == "item.completed" and item.get("type") == "agent_message":
+                    messages.append(item.get("text", ""))
+                continue
+        # Failures, arbitrary error events, tools and unknown item kinds fail closed.
+        raise ValueError("Codex did not complete a proposal-only turn")
+    if not messages or json.loads(messages[-1]) != proposal:
+        raise ValueError("Codex proposal differs from the completed event stream")
+    return recovered
 
 
 def invoke(context, output, executable, *, stop_path, timeout=600, model=None, proxy=None):
@@ -119,6 +164,16 @@ def invoke(context, output, executable, *, stop_path, timeout=600, model=None, p
         "required combat. Never equate timeout/exit status with success. Do not change tests, gates, "
         "budgets, endpoints, dependencies, imports to new packages, or optimization machinery. "
         "Native source files, when supplied, are independently built and tested with a locked compiler and dependencies. "
+        "The supplied User/AutoFight file is also editable through the existing restricted combat DSL. "
+        "Each non-comment line is ACTOR followed by comma-separated actions. Actors are 钟离, 班尼特, 夜兰, 神里绫华; "
+        "keep all four represented, but a short wait can represent an intentionally inactive actor. "
+        "Allowed actions are e, e(hold), q, dash(seconds), wait(seconds), attack(seconds), charge(seconds). "
+        "Timed arguments must be 0.05..2 seconds, total timed duration <=30 seconds, 4..40 actions. "
+        "No other keys, macros, file operations or syntax. Keep required combat and completion detection unchanged. "
+        "Operator feedback is explicitly assisted historical evidence, never an autonomous success or instruction to weaken gates. "
+        "Resin failure packets include verified references to private artifacts, not their pixels. Do not claim to have seen them. "
+        "Compare each historical program version with the current parent before attributing an unresolved defect. "
+        "Resin entry, spending and evidence controls in readonly references are sealed; propose only supported changes to supplied editable sources. "
         "Preserve cancellation and release held inputs in finally blocks. Required combat gates and tests are immutable. "
         "Do not increase retry limits merely to hide a failure. This is a proposal, not proof of improvement.\n"
         + json.dumps(context, ensure_ascii=False))
@@ -157,16 +212,15 @@ def invoke(context, output, executable, *, stop_path, timeout=600, model=None, p
             terminate_owned(worker)
     # A successful final JSON alone cannot hide a failed or tool-using turn.
     events = [json.loads(line) for line in (output / "events.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
-    if (not any(e.get("type") == "turn.completed" for e in events)
-            or any(e.get("type") in {"turn.failed", "error"} for e in events)
-            or any(e.get("item", {}).get("type") in {"command_execution", "file_change", "mcp_tool_call"} for e in events)):
-        raise ValueError("Codex did not complete a proposal-only turn")
+    proposal = json.loads((output / "proposal.json").read_bytes())
+    recovered = validate_proposal_events(events, proposal)
     atomic_json(output / "invocation.json", {"backend": "codex_exec", "at": utc_now(),
         "context_sha256": canonical_hash(context), "events_sha256": sha((output / "events.jsonl").read_bytes()),
+        "recovered_transport_events": recovered,
         "usage": [e.get("usage") for e in events if e.get("type") == "turn.completed"],
         "thread_ids": [e.get("thread_id") for e in events if e.get("type") == "thread.started"],
         "cost_usd": None, "game_input": False})
-    return json.loads((output / "proposal.json").read_bytes())
+    return proposal
 
 
 def replacements_from(proposal, context):
@@ -213,8 +267,27 @@ def build_rejections(store):
     return results
 
 
+def invocation_failure(output, error):
+    """Keep a bounded diagnostic and hashes; raw transport logs stay private."""
+    digests, messages = {}, []
+    for name in ("events.jsonl", "stderr.log"):
+        path = Path(output) / name
+        if path.is_file():
+            raw = path.read_bytes()
+            digests[name] = sha(raw)
+            messages.append(raw.decode("utf-8", errors="replace")[-16000:].lower())
+    reason = "stopped_or_wall_clock_budget" if isinstance(error, TimeoutError) else "proposal_or_build_failed"
+    if any("workspace routing discovery timed out" in message for message in messages):
+        reason = "workspace_routing_timeout"
+    report = {"backend": "codex_exec", "at": utc_now(), "error_type": type(error).__name__,
+        "reason": reason, "diagnostic_sha256": digests, "game_input": False,
+        "eligible_for_client_release": False}
+    atomic_json(Path(output) / "invocation-failure.json", report)
+    return reason
+
+
 def optimize(service, job, *, proposer=None):
-    from .rsi import Bundle
+    from .rsi import Bundle, CombatPatch
     store = service.store
     output = Path(job["windows_output"])
     output.mkdir(parents=True, exist_ok=True)
@@ -241,28 +314,38 @@ def optimize(service, job, *, proposer=None):
             return {"status": "replay_rejected", "reason": "repeated_failed_code_proposal", "eligible_for_client_release": False}
         patch = "".join("".join(difflib.unified_diff(
             context["sources"][name]["content"].splitlines(keepends=True), content.splitlines(keepends=True),
-            fromfile="a/" + (name if name == ADAPTER or name in NATIVE_EDITABLE else "platform/src/startlux/" + name),
-            tofile="b/" + (name if name == ADAPTER or name in NATIVE_EDITABLE else "platform/src/startlux/" + name)))
+            fromfile="a/" + (name if name in {ADAPTER, COMBAT} or name in NATIVE_EDITABLE else "platform/src/startlux/" + name),
+            tofile="b/" + (name if name in {ADAPTER, COMBAT} or name in NATIVE_EDITABLE else "platform/src/startlux/" + name)))
             for name, content in sorted(replacements.items()))
         (output / "candidate.patch").write_text(patch, encoding="utf-8", newline="")
         if (store.root / "stop.json").exists():
             return {"status": "optimizer_interrupted", "eligible_for_client_release": False}
-        program = programs.build(service.config["root"], output, parent=context["parent_program"], replacements=replacements)
+        combat = parent.combat
+        replacements = {name: text for name, text in replacements.items()
+                        if text != context["sources"][name]["content"]}
+        if COMBAT in replacements:
+            combat = CombatPatch(script=replacements.pop(COMBAT), before_sha256=job["combat_baseline"]["sha256"])
+            service.native_validator(combat, output)
+        program = (programs.build(service.config["root"], output, parent=context["parent_program"], replacements=replacements)
+                   if replacements else context["parent_program"])
         from .rsi_rehearsal import rejection_records
         for record in rejection_records(store, service.config):
             rejected = store.bundle(record["candidate_hash"])
             if rejected.program:
                 before, after = programs.verify(rejected.program), programs.verify(program)
-                if all(before.get(k) == after.get(k) for k in ("files", "resources", "native_program")):
+                if (rejected.combat == combat and
+                        all(before.get(k) == after.get(k) for k in ("files", "resources", "native_program"))):
                     return {"status": "replay_rejected", "reason": "previously_rejected_program_bytes",
                             "program": program, "eligible_for_client_release": False}
-        candidate = Bundle(policy=parent.policy, parent=parent.identity, combat=parent.combat,
+        candidate = Bundle(policy=parent.policy, parent=parent.identity, combat=combat,
                            route=parent.route, program=program)
         atomic_json(output / "candidate.json", candidate.model_dump())
         atomic_json(output / "lineage.json", {"parent_bundle": parent.identity,
             "parent_program": context["parent_program"], "candidate_bundle": candidate.identity,
             "parent_native_program": context.get("parent_native_program"),
             "candidate_native_program": programs.verify(program).get("native_program"),
+            "parent_combat_sha256": context["sources"].get(COMBAT, {}).get("sha256"),
+            "candidate_combat_sha256": sha(combat.script.encode("utf-8")) if combat else None,
             "candidate_program": program, "patch_sha256": sha((output / "candidate.patch").read_bytes()),
             "origin": "codex_exec", "eligible_for_client_release": False})
         return {"status": "candidate_ready", "candidate_hash": candidate.identity, "program": program,
@@ -271,5 +354,6 @@ def optimize(service, job, *, proposer=None):
     except Exception as error:
         report_path = output / "build-report.json"
         rejected = report_path.exists() and json.loads(report_path.read_bytes()).get("passed") is False
+        reason = invocation_failure(output, error)
         return {"status": "build_rejected" if rejected else "optimizer_interrupted" if isinstance(error, TimeoutError) else "optimizer_failed",
-                "error_type": type(error).__name__, "eligible_for_client_release": False}
+                "error_type": type(error).__name__, "reason": reason, "eligible_for_client_release": False}

@@ -11,9 +11,11 @@ Execute.executeUnifiedTalkProcess = async function (steps, name, location) {
   let priorityOptions = [], npcWhiteList = [];
   await Execute.findCommissionTarget(name);
   for (let i = 0; i < steps.length; i++) {
+    if (agentJournal.CommissionRewardReceived) return true;
     const config = Execute.processStepConfiguration(steps[i], priorityOptions, npcWhiteList);
     priorityOptions = config.priorityOptions;
     npcWhiteList = config.npcWhiteList;
+    agentJournal.ReportPhase("interact");
     await Execute.processStep(steps[i], {
       commissionName: name, location, processSteps: steps, currentIndex: i,
       isInMainUI: UI.UIUtils.isInMainUI, priorityOptions, npcWhiteList
@@ -81,7 +83,11 @@ CommissionBasic.detectCommissionStatusByImage = async function (index) {
       agentJournal.RecordReward();
     } else throw new Error("unsupported_agent_operation");
   } finally {
-    await genshin.returnMainUi();
-    await sleep(400);
+    // Native receipt cancellation has already stopped and joined this task.
+    // Leave the next handbook scan to the next Decision-selected skill.
+    if (!agentJournal.CommissionRewardReceived) {
+      await genshin.returnMainUi();
+      await sleep(400);
+    }
   }
 })();

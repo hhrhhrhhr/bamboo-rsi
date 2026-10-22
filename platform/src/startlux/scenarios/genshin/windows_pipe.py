@@ -171,8 +171,11 @@ class WindowsPipeSession:
     def cancel(self, command_id):
         return ActionResult.model_validate(self._request("cancel", {"command_id": command_id}))
 
-    def checkpoint(self, command_id):
-        return ActionResult.model_validate(self._request("checkpoint", {"command_id": command_id}))
+    def checkpoint(self, command_id, *, review_frame_id=None):
+        data = {"command_id": command_id}
+        if review_frame_id is not None:
+            data["review_frame_id"] = review_frame_id
+        return ActionResult.model_validate(self._request("checkpoint", data))
 
     def stop(self):
         self._request("stop")

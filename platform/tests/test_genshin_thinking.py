@@ -92,3 +92,14 @@ def test_optimizer_keeps_distinct_training_example_images():
         assert provider.model_images(state) == state.images
     finally:
         provider.close()
+
+
+def test_supervision_keeps_two_frames_for_progress_comparison():
+    frames = ["data:image/png;base64,Y3VycmVudA==", "data:image/png;base64,cHJldmlvdXM="]
+    state = observation(facts={"execution_review":{"image_order":"current_then_previous_review"}},
+                        images=frames)
+    provider = StartLuxRealtimeProvider(provider_settings())
+    try:
+        assert provider.model_images(state) == frames
+    finally:
+        provider.close()

@@ -29,6 +29,43 @@ IMAGE = "data:image/png;base64," + base64.b64encode(b"\x89PNG\r\n\x1a\ntest-only
 SHA = hashlib.sha256(base64.b64decode(IMAGE.split(",")[1])).hexdigest()
 
 
+@pytest.mark.parametrize("code", ["http_500", "http_429", "read_timeout", "transport_error"])
+def test_provider_failure_retains_safe_diagnostics_and_releases_input(code):
+    from test_genshin import FixtureSession, MODEL
+    from startlux.core.settings import TransientProviderError
+    from startlux.scenarios.genshin.runner import RealtimeRunner
+    from startlux.scenarios.genshin.desktop import error_fields
+
+    error = TransientProviderError("untrusted-provider-secret", code=code)
+    class Unavailable:
+        def decide(self, *args):
+            raise error
+
+    session, events = FixtureSession(), []
+    runner = RealtimeRunner(session, Unavailable(), "Task", model=MODEL, audit=events.append)
+    with pytest.raises(TransientProviderError):
+        runner.tick()
+    failure = next(e for e in events if e["type"] == "decision_or_execution_error")
+    assert failure["error_code"] == code and failure["elapsed_ms"] >= 0
+    assert error_fields(error) == {"error_type": "TransientProviderError", "error_code": code}
+    assert "untrusted-provider-secret" not in json.dumps(events)
+    assert session.stops == 1 and not session.starts and runner.stopped.is_set()
+    assert runner.tick()["status"] == "stopped"
+
+
+def test_assessment_keeps_provider_error_category_without_counting_success(tmp_path):
+    run, _ = capture_run(tmp_path, "provider-error", complete=False, initial=0)
+    path = run / "trace.jsonl"
+    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    records.insert(-3, {"type": "decision_or_execution_error", "request_id": "request-2",
+        "error_type": "TransientProviderError", "error_code": "http_503", "elapsed_ms": 123.0})
+    path.write_text("\n".join(json.dumps(e) for e in records) + "\n", encoding="utf-8")
+    result = assess_run(run)
+    failure = next(e for e in result["failures"] if e["code"] == "decision_or_execution_error")
+    assert failure["error_code"] == "http_503" and failure["elapsed_ms"] == 123.0
+    assert result["game_complete"] is False
+
+
 def state(day="2026-10-19", count=None, claimed=False, frame=1):
     scope = AccountScope(account_id=CONFIG["uid"], server_id="cn", game_day=day)
     facts = {"region": "Mondstadt", "scene": "world", "account_verified": True,
@@ -183,8 +220,9 @@ def test_claimed_report_with_corrupt_pixels_cannot_be_success(tmp_path):
     assert "invalid_observation_evidence" in {issue["code"] for issue in assessment["issues"]}
 
 
-@pytest.mark.parametrize("checkpoint", [False, True])
-def test_complete_scoped_model_execution_can_qualify_without_claiming_release(tmp_path, checkpoint):
+@pytest.mark.parametrize("checkpoint", [False, True, "incomplete"])
+@pytest.mark.parametrize("first_skill", ["daily.execute", "daily.recover"])
+def test_complete_scoped_model_execution_can_qualify_without_claiming_release(tmp_path, checkpoint, first_skill):
     source = tmp_path / "source"
     source.mkdir()
     (source / "agent-main.js").write_text("// test execution")
@@ -196,6 +234,10 @@ def test_complete_scoped_model_execution_can_qualify_without_claiming_release(tm
     audit({"type": "policy_loaded", "policy_hash": "test-policy"})
     for index, action in enumerate(["quest-1", "quest-2", "quest-3", "quest-4", "claim"]):
         current = state(count=index, frame=index)
+        if index == 0 and first_skill == "daily.recover":
+            current.facts.update(daily_recovery_v1=True, daily_recovery_grounded=True,
+                daily_slot_1_pending=False, daily_slot_1_retry=True, daily_slot_1_local_recovery=True)
+            action = "recover.1.ranged"
         options = pack.candidates(current)
         option = next(o for o in options if o.id == action)
         request_id = str(index)
@@ -212,19 +254,39 @@ def test_complete_scoped_model_execution_can_qualify_without_claiming_release(tm
                "request_id": request_id, "catalog_hash": catalog, "option": option.model_dump(),
                "scope": current.scope.model_dump(), "session_id": current.session_id,
                "control_generation": current.control_generation}})
+        if index == 0:
+            from startlux.scenarios.genshin.contracts import ActionOption
+            review = current.model_copy(deep=True)
+            review.facts["daily_review_interruptible"] = True
+            review_options = [ActionOption(id=name, label=name, skill="supervision." + name,
+                skill_version="1", preconditions={"daily_review_interruptible":True}) for name in ("continue", "rescan")]
+            audit({"type":"supervision_requested", "request_id":"review-1", "command_id":request_id,
+                "observation":audit.archive_observation(review), "observation_hash":review.binding(),
+                "requested_model":CONFIG["model_id"], "catalog":[o.model_dump() for o in review_options],
+                "catalog_hash":catalog_hash(review_options)})
+            audit({"type":"supervision_received", "command_id":request_id, "receipt":{
+                "request_id":"review-1", "observation_hash":review.binding(), "catalog_hash":catalog_hash(review_options),
+                "model":CONFIG["model_id"], "outcome":"selected", "choice_id":"continue", "elapsed_ms":11.0,
+                "payload_hash":"fixture", "raw_response":{"usage":{"input_tokens":17,"output_tokens":3}}}})
         audit({"type": "action_result", "result": {"command_id": request_id,
                "status": "cancelled" if checkpoint and index == 0 else "succeeded"}})
         if checkpoint and index == 0:
             audit({"type": "action_timeout", "command_id": request_id})
             audit({"type": "timeout_checkpoint_ready", "command_id": request_id})
-            audit({"type": "timeout_checkpoint_observation", "command_id": request_id,
-                   "observation": audit.archive_observation(state(count=1, frame=10))})
+            audit({"type": "commission_incomplete_replan" if checkpoint == "incomplete" else "timeout_checkpoint_observation",
+                   "command_id": request_id, "completed": checkpoint != "incomplete",
+                   "observation": audit.archive_observation(state(count=0 if checkpoint == "incomplete" else 1, frame=10))})
     audit({"type": "final_observation", "observation": audit.archive_observation(state(count=4, claimed=True, frame=6))})
     audit({"type": "input_stop", "acknowledged": True})
     audit({"type": "run_ended", "termination_reason": "no_candidates"})
     audit.close()
     result = assess_run(run)
-    assert result["autonomy_eligible"], result["issues"]
+    assert result["autonomy_eligible"] == (checkpoint != "incomplete"), result["issues"]
+    assert result["supervision_requests"] == result["supervision_receipts"] == 1
+    assert result["decision_requests"] == 6 and result["decision_elapsed_ms"] == 36
+    assert result["known_policy_tokens"] == 20
+    if checkpoint == "incomplete":
+        assert {i["code"] for i in result["issues"]} == {"daily_input_coverage_incomplete"}
     assert not result["eligible_for_client_release"] and result["cost_usd"] is None
     assert not result["token_usage_complete"]
     if checkpoint:
@@ -232,7 +294,7 @@ def test_complete_scoped_model_execution_can_qualify_without_claiming_release(tm
         trace = run / "trace.jsonl"
         events = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
         for event in events:
-            if event["type"] == "timeout_checkpoint_observation":
+            if event["type"] in {"timeout_checkpoint_observation", "commission_incomplete_replan"}:
                 event["observation"]["control_generation"] += 1
         trace.write_text("\n".join(json.dumps(e) for e in events) + "\n", encoding="utf-8")
         rejected = assess_run(run)
@@ -321,8 +383,10 @@ def test_desktop_abstention_recovery_gets_fresh_receipts_then_stops(tmp_path, mo
         starts = 0
         frame = 0
         def describe(self):
+            from startlux.scenarios.genshin.recovery_actions import recovery_options
             manifest = next((tmp_path / "runs").glob("*/pack/manifest.json"))
             return {"decision_model": CONFIG["model_id"],
+                    "daily_recovery_v1": True, "recovery_catalog": [o.model_dump() for o in recovery_options()],
                     "timed_route_policy": {"skip_optional_fights_below_seconds": 0},
                     "manifest_file_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest()}
         def observe(self):

@@ -107,7 +107,11 @@ class TaskPack:
         return cls(root, manifest, options, instructions)
 
     def candidates(self, observation: Observation) -> list[ActionOption]:
-        return [option.model_copy(deep=True) for option in self.options if option.available(observation)]
+        options = list(self.options)
+        if self.manifest.environment == "windows" and observation.facts.get("daily_recovery_v1") is True:
+            from .recovery_actions import recovery_options
+            options.extend(recovery_options())
+        return [option.model_copy(deep=True) for option in options if option.available(observation)]
 
 
 def export_taskpack(source: Path | str, destination: Path | str) -> TaskPack:
