@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bamboo-rsi-core"
+version = "0.1.0"
+description = "Domain-scoped recursive optimization with frozen evaluation and durable lineage"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = []
+
+[project.scripts]
+bamboo-rsi = "bamboo_rsi.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
