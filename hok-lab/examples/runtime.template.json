@@ -1,0 +1,15 @@
+{
+  "server": "127.0.0.1:23432",
+  "server_build": "REPLACE_WITH_VERIFIED_GAMECORE_BUILD_SHA256",
+  "ai_ip": "127.0.0.1",
+  "ai_ports": [35150, 35151],
+  "sdk_python": "/opt/hok/python39/bin/python3.9",
+  "sdk_root": "/opt/hok/sdk",
+  "model_root": "/opt/hok/frozen-model",
+  "predictor": "/opt/hok/frozen-model/predictor.py",
+  "recorder": "/opt/hok/frozen-model/recorder.py",
+  "max_frames": 30000,
+  "max_calls": 10000,
+  "episode_seconds": 1800,
+  "sdk_commit": "c6e0029a5e4b6e037a049804fdbe23ac74484311"
+}

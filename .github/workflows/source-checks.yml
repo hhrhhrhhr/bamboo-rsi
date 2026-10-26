@@ -24,4 +24,6 @@ jobs:
       - run: python -m pytest platform/tests -q
       - run: python -m pytest rsi-core/tests -q -c rsi-core/pyproject.toml
       - run: python -m pytest resin-lab/tests -q -c resin-lab/pyproject.toml
+      - run: python -m pip install -r hok-lab/requirements-test.lock
+      - run: python -m pytest hok-lab/tests -q -c hok-lab/pyproject.toml
       - run: node --test integrations/auto_commission/agent-main.test.cjs

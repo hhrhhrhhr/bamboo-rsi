@@ -1,0 +1,42 @@
+name: Android prototype (no game or account access)
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m unittest discover -s android-app/tools/tests -v
+      - run: gradle -p android-app --no-daemon testDebugUnitTest lintDebug assembleDebug assembleDebugAndroidTest
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-development-apk
+          path: android-app/app/build/outputs/apk/debug/app-debug.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-device-test-apk-not-executed
+          path: android-app/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: android-check-results
+          path: |
+            android-app/app/build/test-results/testDebugUnitTest/
+            android-app/app/build/reports/lint-results-debug.*

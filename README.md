@@ -10,6 +10,8 @@
 - `platform/`：执行内核、原神适配器、运行证据、录像归档、RSI 协调器及回归测试；保留文件账目示例用于验证通用平台。
 - `integrations/`：固定版本 AutoCommission 源码、BetterGI 改造补丁及战斗策略。
 - `scripts/`：可复现构建、开发试跑和停止入口。
+- `android-app/`：[手机独立运行的王者荣耀实验适配器](android-app/README.md)，提供截图点选校准、Decision 有界技能、录像导出、策略候选与签名对照晋级流程；尚未通过手机实机对战或 RSI 晋级验收。
+- `hok-lab/`：[腾讯 Gamecore 1v1 接入与策略 RSI](hok-lab/README.md)，提供独立 SDK 工作进程、冻结运行环境、动作与终局校验、固定配对评测及父版本继承；运行包、预测器权重、录像适配与独立签名服务尚待实际部署验收，不代表手机 5v5 已接通。
 
 源码来自 [Game Harness Lab 的 hhr-yuanshen 分支](https://github.com/dctongsheng/game-harness-lab/tree/hhr-yuanshen)，底座提交 `1a7b0ca`，包含截至 2026-10-21 的本地原神 RSI 开发增量。本仓库以新的源码快照开始历史，聚焦原神 RSI；不携带旧小游戏实验、旧安装包、本机账号配置、运行记录或录像。
 

@@ -1,0 +1,25 @@
+name: HoK Lab Linux integration (no game or account access)
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  linux-host:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install -r hok-lab/requirements-test.lock pytest==9.1.1
+      - run: python -m pip install --no-deps -e ./rsi-core -e ./hok-lab
+      - run: python -m pytest hok-lab/tests -q -c hok-lab/pyproject.toml --junitxml=hok-test-results.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hok-linux-offline-test-results
+          path: hok-test-results.xml

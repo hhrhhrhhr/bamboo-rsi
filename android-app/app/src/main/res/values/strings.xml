@@ -1,0 +1,1 @@
+<resources><string name="accessibility_description">仅在你启动实验且王者荣耀位于前台时，采集游戏画面并执行 Decision 选择的有限触控动作。画面会发送到你配置的模型服务；运行证据保存在本机。可以随时停止。</string></resources>

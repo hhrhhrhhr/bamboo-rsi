@@ -50,3 +50,11 @@ api_key.txt
 *.mkv
 *.exe
 *.zip
+
+# Local Android toolchains, generated application packages, and signing files.
+android-app/.gradle/
+android-app/local.properties
+*.apk
+*.aab
+*.jks
+*.keystore

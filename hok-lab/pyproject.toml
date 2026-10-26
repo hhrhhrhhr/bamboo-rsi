@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bamboo-hok-lab"
+version = "0.1.1"
+description = "Frozen Gamecore experiments with independent paired evaluation"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = ["bamboo-rsi-core==0.1.0", "cryptography==50.0.2", "psutil==7.2.2"]
+
+[project.scripts]
+bamboo-hok = "bamboo_hok.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "../rsi-core/src"]
+testpaths = ["tests"]
