@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bamboo-rsi-sdk"
+version = "0.1.0"
+description = "Task integrations and independently verified optimization workflows"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = ["bamboo-rsi-core==0.1.0"]
+
+[project.scripts]
+bamboo-rsi-sdk = "bamboo_rsi_sdk.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "../rsi-core/src"]
+testpaths = ["tests"]

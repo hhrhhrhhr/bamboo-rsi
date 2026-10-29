@@ -1,0 +1,1 @@
+"""Example installed business integration."""

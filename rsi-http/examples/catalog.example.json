@@ -1,0 +1,21 @@
+{
+  "integrations": [
+    {
+      "task_id": "acme.inventory_read",
+      "executor": {
+        "base_url": "https://rsi-reader.example.com",
+        "token_env": "RSI_READER_TOKEN",
+        "timeout_seconds": 10
+      },
+      "verifier": {
+        "base_url": "https://rsi-auditor.example.com",
+        "token_env": "RSI_AUDITOR_TOKEN",
+        "timeout_seconds": 10
+      },
+      "manifest_sha256": "REPLACE_WITH_INSPECTED_MANIFEST_SHA256",
+      "verification_key_env": "RSI_VERIFICATION_KEY",
+      "cases_per_round": 3
+    }
+  ],
+  "optimizer": {"executable": "codex"}
+}

@@ -1,0 +1,8 @@
+{
+  "game_executable": "",
+  "ffmpeg_executable": "",
+  "decision_endpoint": "https://api.bamboonode.cn/v1/decisions",
+  "model": "startlux-decision-27b-autothink",
+  "objective": "在用户已经进入的训练或获准测试场景中观察画面，提出下一步动作建议。",
+  "call_budget": 20
+}

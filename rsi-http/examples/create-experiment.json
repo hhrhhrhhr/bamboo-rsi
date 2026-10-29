@@ -1,0 +1,4 @@
+{
+  "experiment": "inventory-rounds",
+  "integration": "acme.inventory_read"
+}

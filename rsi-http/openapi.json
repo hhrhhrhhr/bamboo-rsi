@@ -1,0 +1,1134 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Bamboo RSI HTTP protocol",
+    "version": "1.0.0",
+    "description": "Control API and enterprise bridge API, served on distinct configured origins. Only read-only or isolated shadow evaluation; internal promotion does not deploy to production. All 202 responses must be polled."
+  },
+  "servers": [
+    {
+      "url": "http://127.0.0.1:8079",
+      "description": "Internal control API; use HTTPS reverse proxy for remote access"
+    }
+  ],
+  "security": [
+    {
+      "bearerAuth": []
+    }
+  ],
+  "paths": {
+    "/v1/integrations": {
+      "get": {
+        "operationId": "listIntegrations",
+        "tags": [
+          "Control"
+        ],
+        "responses": {
+          "200": {
+            "description": "Registered trusted integrations",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "integrations": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string",
+                            "pattern": "^[a-z][a-z0-9_.-]{0,95}$"
+                          },
+                          "task": {
+                            "$ref": "#/components/schemas/Task"
+                          },
+                          "fingerprint": {
+                            "type": "string",
+                            "pattern": "^[a-f0-9]{64}$"
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "task",
+                          "fingerprint"
+                        ],
+                        "additionalProperties": false
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/experiments": {
+      "post": {
+        "operationId": "createExperiment",
+        "tags": [
+          "Control"
+        ],
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_.:-]{16,128}$"
+            },
+            "description": "Reuse this key with identical content after a lost response. Conflicting content returns 409."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateExperiment"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Durably registered asynchronous operation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Operation"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Busy worker or conflicting idempotency key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/experiments/{experiment}": {
+      "get": {
+        "operationId": "experimentStatus",
+        "tags": [
+          "Control"
+        ],
+        "parameters": [
+          {
+            "name": "experiment",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9_.-]{0,95}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Verified accepted version, pending jobs and durable budget",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/experiments/{experiment}/actions": {
+      "post": {
+        "operationId": "submitAction",
+        "tags": [
+          "Control"
+        ],
+        "parameters": [
+          {
+            "name": "experiment",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9_.-]{0,95}$"
+            }
+          },
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_.:-]{16,128}$"
+            },
+            "description": "Reuse this key with identical content after a lost response. Conflicting content returns 409."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Action"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Operation accepted; not proof of task success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Operation"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Worker busy or idempotency conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/operations/{operation_id}": {
+      "get": {
+        "operationId": "operationStatus",
+        "tags": [
+          "Control"
+        ],
+        "parameters": [
+          {
+            "name": "operation_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-f0-9]{32}$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Durable operation state and result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Operation"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/rsi/v1/manifest": {
+      "get": {
+        "operationId": "readTaskManifest",
+        "tags": [
+          "Enterprise executor"
+        ],
+        "responses": {
+          "200": {
+            "description": "Frozen redacted task manifest; pin SHA256 before using it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Manifest"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/rsi/v1/execute": {
+      "post": {
+        "operationId": "executeCandidate",
+        "tags": [
+          "Enterprise executor"
+        ],
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-f0-9]{32}$"
+            },
+            "description": "Reuse this key with identical content after a lost response. Conflicting content returns 409."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExecutionPacket"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Original execution evidence, not a promotion verdict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Execution"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Request binding changed or unknown previous outcome",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/rsi/v1/verify": {
+      "post": {
+        "operationId": "verifyExecution",
+        "tags": [
+          "Independent verifier"
+        ],
+        "parameters": [
+          {
+            "name": "Idempotency-Key",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[a-f0-9]{32}$"
+            },
+            "description": "Reuse this key with identical content after a lost response. Conflicting content returns 409."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VerificationPacket"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Signed independent verification. Verifier owns the truth source and audit journal.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Proof"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid bearer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer"
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "error"
+        ],
+        "additionalProperties": false
+      },
+      "Revisions": {
+        "type": "object",
+        "properties": {
+          "executor": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          },
+          "verifier": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          },
+          "dataset": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          }
+        },
+        "required": [
+          "executor",
+          "verifier",
+          "dataset"
+        ],
+        "additionalProperties": false
+      },
+      "Metric": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_.-]{0,95}$"
+          },
+          "direction": {
+            "enum": [
+              "minimize",
+              "maximize"
+            ]
+          },
+          "reduction": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "exclusiveMaximum": 1
+          },
+          "regression": {
+            "type": "number",
+            "minimum": 0,
+            "exclusiveMaximum": 1
+          }
+        },
+        "required": [
+          "id",
+          "direction",
+          "reduction",
+          "regression"
+        ],
+        "additionalProperties": false
+      },
+      "Limits": {
+        "type": "object",
+        "properties": {
+          "proposals": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 500
+          },
+          "runs": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100000
+          },
+          "run_seconds": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "maximum": 86400
+          }
+        },
+        "required": [
+          "proposals",
+          "runs",
+          "run_seconds"
+        ],
+        "additionalProperties": false
+      },
+      "Task": {
+        "type": "object",
+        "properties": {
+          "schema_version": {
+            "const": 1
+          },
+          "id": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_.-]{0,95}$"
+          },
+          "objective": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4000
+          },
+          "editable": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 32,
+            "items": {
+              "type": "string"
+            }
+          },
+          "metrics": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "$ref": "#/components/schemas/Metric"
+            }
+          },
+          "primary_metric": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_.-]{0,95}$"
+          },
+          "limits": {
+            "$ref": "#/components/schemas/Limits"
+          },
+          "origins": {
+            "type": "array",
+            "prefixItems": [
+              {
+                "const": "remote_execution"
+              }
+            ],
+            "minItems": 1,
+            "maxItems": 1
+          },
+          "capabilities": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9_.-]{0,95}$"
+            }
+          },
+          "evidence_scope": {
+            "enum": [
+              "offline_reference",
+              "local_benchmark",
+              "business_validation"
+            ]
+          }
+        },
+        "required": [
+          "schema_version",
+          "id",
+          "objective",
+          "editable",
+          "metrics",
+          "primary_metric",
+          "limits",
+          "origins",
+          "capabilities",
+          "evidence_scope"
+        ],
+        "additionalProperties": false
+      },
+      "Case": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_.-]{0,95}$"
+          },
+          "inputs": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "required": [
+          "id",
+          "inputs"
+        ],
+        "additionalProperties": false
+      },
+      "Files": {
+        "type": "object",
+        "minProperties": 1,
+        "maxProperties": 32,
+        "additionalProperties": {
+          "type": "string",
+          "maxLength": 2000000
+        }
+      },
+      "Manifest": {
+        "type": "object",
+        "properties": {
+          "protocol": {
+            "const": "bamboo-rsi-http/1"
+          },
+          "mode": {
+            "enum": [
+              "read_only",
+              "shadow"
+            ]
+          },
+          "task": {
+            "$ref": "#/components/schemas/Task"
+          },
+          "revisions": {
+            "$ref": "#/components/schemas/Revisions"
+          },
+          "initial_files": {
+            "$ref": "#/components/schemas/Files"
+          },
+          "training": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "cases": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 10000,
+            "items": {
+              "$ref": "#/components/schemas/Case"
+            }
+          }
+        },
+        "required": [
+          "protocol",
+          "mode",
+          "task",
+          "revisions",
+          "initial_files",
+          "training",
+          "cases"
+        ],
+        "additionalProperties": false
+      },
+      "Version": {
+        "type": "object",
+        "properties": {
+          "domain": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_.-]{0,95}$"
+          },
+          "files": {
+            "$ref": "#/components/schemas/Files"
+          },
+          "contract": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          },
+          "parent": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[a-f0-9]{64}$"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "id": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          }
+        },
+        "required": [
+          "domain",
+          "files",
+          "contract",
+          "parent",
+          "id"
+        ],
+        "additionalProperties": false
+      },
+      "ExecutionRequest": {
+        "type": "object",
+        "properties": {
+          "protocol": {
+            "const": "bamboo-rsi-http/1"
+          },
+          "execution_id": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{32}$"
+          },
+          "task_id": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_.-]{0,95}$"
+          },
+          "manifest_sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          },
+          "revisions": {
+            "$ref": "#/components/schemas/Revisions"
+          },
+          "mode": {
+            "enum": [
+              "read_only",
+              "shadow"
+            ]
+          },
+          "version": {
+            "$ref": "#/components/schemas/Version"
+          },
+          "case": {
+            "$ref": "#/components/schemas/Case"
+          }
+        },
+        "required": [
+          "protocol",
+          "execution_id",
+          "task_id",
+          "manifest_sha256",
+          "revisions",
+          "mode",
+          "version",
+          "case"
+        ],
+        "additionalProperties": false
+      },
+      "ExecutionPacket": {
+        "type": "object",
+        "properties": {
+          "request": {
+            "$ref": "#/components/schemas/ExecutionRequest"
+          },
+          "request_sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          }
+        },
+        "required": [
+          "request",
+          "request_sha256"
+        ],
+        "additionalProperties": false
+      },
+      "Execution": {
+        "type": "object",
+        "properties": {
+          "protocol": {
+            "const": "bamboo-rsi-http/1"
+          },
+          "execution_id": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{32}$"
+          },
+          "request_sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          },
+          "manifest_sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          },
+          "executor_revision": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          },
+          "origin": {
+            "const": "remote_execution"
+          },
+          "assisted": {
+            "const": false
+          },
+          "result": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "required": [
+          "protocol",
+          "execution_id",
+          "request_sha256",
+          "manifest_sha256",
+          "executor_revision",
+          "origin",
+          "assisted",
+          "result"
+        ],
+        "additionalProperties": false
+      },
+      "VerificationPacket": {
+        "type": "object",
+        "properties": {
+          "request": {
+            "$ref": "#/components/schemas/ExecutionRequest"
+          },
+          "request_sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          },
+          "execution": {
+            "$ref": "#/components/schemas/Execution"
+          },
+          "evidence_sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          }
+        },
+        "required": [
+          "request",
+          "request_sha256",
+          "execution",
+          "evidence_sha256"
+        ],
+        "additionalProperties": false
+      },
+      "Measurement": {
+        "type": "object",
+        "properties": {
+          "success": {
+            "type": "boolean"
+          },
+          "metrics": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "number",
+              "minimum": 0
+            }
+          }
+        },
+        "required": [
+          "success",
+          "metrics"
+        ],
+        "additionalProperties": false
+      },
+      "VerificationPayload": {
+        "type": "object",
+        "properties": {
+          "protocol": {
+            "const": "bamboo-rsi-http/1"
+          },
+          "task_id": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_.-]{0,95}$"
+          },
+          "manifest_sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          },
+          "verifier_revision": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          },
+          "execution_id": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{32}$"
+          },
+          "version_id": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          },
+          "case_id": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_.-]{0,95}$"
+          },
+          "request_sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          },
+          "evidence_sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          },
+          "measurement": {
+            "$ref": "#/components/schemas/Measurement"
+          }
+        },
+        "required": [
+          "protocol",
+          "task_id",
+          "manifest_sha256",
+          "verifier_revision",
+          "execution_id",
+          "version_id",
+          "case_id",
+          "request_sha256",
+          "evidence_sha256",
+          "measurement"
+        ],
+        "additionalProperties": false
+      },
+      "Proof": {
+        "type": "object",
+        "properties": {
+          "payload_base64": {
+            "type": "string",
+            "contentEncoding": "base64",
+            "description": "UTF-8 JSON matching VerificationPayload. Verify the HMAC over decoded bytes before parsing; never reserialize first."
+          },
+          "signature_hex": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$",
+            "description": "HMAC-SHA256 of decoded payload bytes using verifier-only trust key"
+          }
+        },
+        "required": [
+          "payload_base64",
+          "signature_hex"
+        ],
+        "additionalProperties": false
+      },
+      "Proposal": {
+        "type": "object",
+        "properties": {
+          "summary": {
+            "type": "string"
+          },
+          "hypothesis": {
+            "type": "string"
+          },
+          "changes": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "before_sha256": {
+                  "type": "string",
+                  "pattern": "^[a-f0-9]{64}$"
+                },
+                "content": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path",
+                "before_sha256",
+                "content"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": [
+          "summary",
+          "hypothesis",
+          "changes"
+        ],
+        "additionalProperties": false
+      },
+      "Operation": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{32}$"
+          },
+          "status": {
+            "enum": [
+              "queued",
+              "running",
+              "succeeded",
+              "failed",
+              "interrupted"
+            ]
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "result": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": true
+          }
+        },
+        "required": [
+          "id",
+          "status",
+          "created_at",
+          "result"
+        ],
+        "additionalProperties": false
+      },
+      "CreateExperiment": {
+        "type": "object",
+        "properties": {
+          "experiment": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_.-]{0,95}$"
+          },
+          "integration": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_.-]{0,95}$"
+          }
+        },
+        "required": [
+          "experiment",
+          "integration"
+        ],
+        "additionalProperties": false
+      },
+      "Action": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "operation": {
+                "enum": [
+                  "prepare",
+                  "step"
+                ]
+              },
+              "proposal": {
+                "$ref": "#/components/schemas/Proposal"
+              }
+            },
+            "required": [
+              "operation"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "operation": {
+                "enum": [
+                  "advance",
+                  "finish",
+                  "recover"
+                ]
+              },
+              "job": {
+                "type": "string",
+                "pattern": "^[a-f0-9]{32}$"
+              }
+            },
+            "required": [
+              "operation",
+              "job"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "operation": {
+                "const": "rollback"
+              },
+              "expected_version": {
+                "type": "string",
+                "pattern": "^[a-f0-9]{64}$"
+              },
+              "reason": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1000
+              }
+            },
+            "required": [
+              "operation",
+              "expected_version",
+              "reason"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "operation": {
+                "enum": [
+                  "stop",
+                  "resume"
+                ]
+              }
+            },
+            "required": [
+              "operation"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      }
+    }
+  }
+}

@@ -1,0 +1,35 @@
+name: RSI HTTP cross-language integration
+on:
+  push:
+    paths: ['rsi-http/**', 'rsi-sdk/**', 'rsi-core/**', '.github/workflows/rsi-http.yml']
+  pull_request:
+    paths: ['rsi-http/**', 'rsi-sdk/**', 'rsi-core/**', '.github/workflows/rsi-http.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  http:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.x'
+          cache: false
+      - run: python -m pip install -e ./rsi-core -e ./rsi-sdk -e ./rsi-http pytest==9.1.1 openapi-spec-validator==0.7.2
+      - run: python -m pytest rsi-http/tests -q -c rsi-http/pyproject.toml
+      - run: python -m pytest rsi-sdk/tests rsi-core/tests -q -c rsi-sdk/pyproject.toml
+      - run: python -m openapi_spec_validator rsi-http/openapi.json
+      - run: bamboo-rsi-http demo-http --destination .runtime/http-ci-demo
+      - run: python scripts/check_public_tree.py

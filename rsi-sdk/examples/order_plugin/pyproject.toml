@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bamboo-rsi-example-orders"
+version = "0.1.0"
+description = "Installed integration example, not production business validation"
+requires-python = ">=3.11"
+dependencies = ["bamboo-rsi-sdk==0.1.0"]
+license = "MIT"
+license-files = ["LICENSE"]
+
+[project.entry-points."bamboo_rsi.integrations"]
+"example.invoice_reconciliation" = "example_orders.integration:create"
+
+[tool.setuptools.packages.find]
+where = ["src"]

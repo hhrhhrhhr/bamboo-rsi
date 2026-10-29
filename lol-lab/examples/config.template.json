@@ -1,0 +1,9 @@
+{
+  "game_executable": "",
+  "ffmpeg_executable": "",
+  "riot_ca_certificate": "",
+  "decision_endpoint": "https://api.bamboonode.cn/v1/decisions",
+  "model": "startlux-decision-27b-autothink",
+  "call_budget": 500,
+  "scenario": {"champion": "Garen", "map": "Map11", "team": "ORDER", "start_time": 30, "duration": 300, "opponents": ["Garen"]}
+}

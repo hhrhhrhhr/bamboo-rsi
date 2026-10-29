@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bamboo-rsi-http"
+version = "0.1.0"
+description = "Language-neutral HTTP integrations and control API for Bamboo RSI"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = ["bamboo-rsi-sdk==0.1.0"]
+
+[project.scripts]
+bamboo-rsi-http = "bamboo_rsi_http.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.data-files]
+"share/bamboo-rsi-http" = ["openapi.json", "PROTOCOL.md", "README.md"]
+"share/bamboo-rsi-http/examples/java" = ["examples/java/RsiClient.java"]
+"share/bamboo-rsi-http/examples/go" = ["examples/go/main.go"]
+"share/bamboo-rsi-http/examples" = ["examples/catalog.example.json", "examples/create-experiment.json", "examples/prepare.json"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "../rsi-sdk/src", "../rsi-core/src"]
+testpaths = ["tests"]

@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bamboo-lol-lab"
+version = "0.1.0"
+description = "Bounded League of Legends training adapter and prospective policy RSI"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = ["bamboo-rsi-core==0.1.0", "bamboo-delta-lab==0.1.0", "httpx==0.28.1",
+    "windows-capture==2.0.1; sys_platform == 'win32'", "numpy==2.5.4", "opencv-python==5.0.0.93"]
+
+[project.scripts]
+bamboo-lol = "bamboo_lol.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "../rsi-core/src", "../delta-lab/src"]
+testpaths = ["tests"]

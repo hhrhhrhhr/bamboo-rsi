@@ -1,0 +1,4 @@
+{
+  "dataset": ".runtime/private-orders-dataset",
+  "limits": {"proposals": 4, "runs": 48, "run_seconds": 30}
+}

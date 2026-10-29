@@ -9,5 +9,6 @@ The Python distribution includes both original MIT contributions and inherited G
 - Google Harness²: https://github.com/google-research/harness2, Apache-2.0, pinned `1cfe254e8d25b15f37048c3730134686abe60335`. Optional optimizer dependency; see `platform/LICENSE.Harness2`. It is not bundled into the Windows agent.
 - Vosk API and the Chinese ASR model: Apache-2.0; the model is downloaded from the official source at build time with a pinned hash. See `desktop/THIRD_PARTY_NOTICES.txt` and `desktop/APACHE-2.0.txt`.
 - Python, .NET and other dependencies retain their distribution licenses. The desktop build copies dependency notices and corresponding modified source into the distributable payload.
+- LoL Lab uses `windows-capture` 2.0.1 (MIT, https://github.com/NiiightmareXD/windows-capture), NumPy 2.5.4 (BSD-3-Clause), and OpenCV Python 5.0.0.93 (retain its wheel's bundled third-party notices). These packages are separate runtime dependencies; their binaries and license files are not copied into this source repository. Redistributors must retain the notices delivered with their chosen wheels.
 
 This repository does not include the proprietary game client, private runtime evidence, account settings, credentials, or legacy installer binaries.

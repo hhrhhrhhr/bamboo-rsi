@@ -1,0 +1,9 @@
+{
+  "game_executable": "",
+  "ffmpeg_executable": "",
+  "riot_ca_certificate": "",
+  "decision_endpoint": "https://api.bamboonode.dev/jev/v1/decisions",
+  "model": "typesafe/jev-1.14",
+  "call_budget": 500,
+  "scenario": {"champion": "Garen", "map": "Map11", "team": "ORDER", "start_time": 30, "duration": 300, "opponents": ["Garen"]}
+}

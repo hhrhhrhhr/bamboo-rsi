@@ -8,10 +8,14 @@
 
 - `desktop/`：Windows 桌面/语音界面，本机设置与 DPAPI 凭据存储。
 - `platform/`：执行内核、原神适配器、运行证据、录像归档、RSI 协调器及回归测试；保留文件账目示例用于验证通用平台。
+- `rsi-sdk/`：[业务接入 SDK](rsi-sdk/README.md)，统一任务契约、执行、独立核验、评测、候选晋级和继承；提供本地订单对账及仓库检索参考实现，支持安装业务插件。示例演示不代表生产业务或游戏验收。
+- `rsi-http/`：[企业 HTTP 接入](rsi-http/README.md)，为 Java、Go 等系统提供任务桥接与异步实验控制 API，附 OpenAPI、客户端示例、独立核验凭证和幂等恢复；只读/影子示例不代表生产业务验收。
 - `integrations/`：固定版本 AutoCommission 源码、BetterGI 改造补丁及战斗策略。
 - `scripts/`：可复现构建、开发试跑和停止入口。
 - `android-app/`：[手机独立运行的王者荣耀实验适配器](android-app/README.md)，提供截图点选校准、Decision 有界技能、录像导出、策略候选与签名对照晋级流程；尚未通过手机实机对战或 RSI 晋级验收。
 - `hok-lab/`：[腾讯 Gamecore 1v1 接入与策略 RSI](hok-lab/README.md)，提供独立 SDK 工作进程、冻结运行环境、动作与终局校验、固定配对评测及父版本继承；运行包、预测器权重、录像适配与独立签名服务尚待实际部署验收，不代表手机 5v5 已接通。
+- `delta-lab/`：[三角洲行动 Windows 观察探针](delta-lab/README.md)，提供指定窗口录像、Decision 结构化建议、延迟与失败留证；当前不发送游戏输入，尚未接通战斗、撤离或实机 RSI 晋级。
+- `lol-lab/`：[英雄联盟 Windows 电脑对手实验](lol-lab/README.md)，提供 Live Client 遥测、Decision 有限键鼠动作、原始录像、固定对线指标评估和策略候选继承；当前通过离线验证，尚未验收实机操作、完整对局或真实晋级。
 
 源码来自 [Game Harness Lab 的 hhr-yuanshen 分支](https://github.com/dctongsheng/game-harness-lab/tree/hhr-yuanshen)，底座提交 `1a7b0ca`，包含截至 2026-10-21 的本地原神 RSI 开发增量。本仓库以新的源码快照开始历史，聚焦原神 RSI；不携带旧小游戏实验、旧安装包、本机账号配置、运行记录或录像。
 
@@ -87,6 +91,10 @@ platform/.venv/Scripts/python.exe scripts/build_genshin_desktop.py --bettergi .r
 决策会向第三方模型服务发送游戏截图、任务状态、UID 范围信息及可选动作，属于联网调用。运行日志、截图与视频也可能含账号信息；公开分享前需另行检查。仓库的忽略规则和发布检查只是防误提交措施，不能代替密钥轮换。已公开或分享过的 Key 应在服务商处撤销并换新。
 
 ## RSI 验收边界
+
+跨业务扩展从 [RSI SDK 接入契约](rsi-sdk/INTEGRATION.md) 开始：业务实现执行器与独立核验器，可复用或替换评测策略，通过插件注册接入统一协调器。SDK 单独部署，复用现有核心存储，不改变已冻结的原神、LoL、王者实验。候选晋级只改变本实验的接受指针，生产部署和外部业务操作需要具体适配器与独立验收。
+
+Java、Go 或已有企业 API 可通过 [HTTP 接入协议](rsi-http/PROTOCOL.md) 提供数据快照、候选执行和独立核验，无需在业务系统中嵌入 Python。RSI 控制 API 提供实验、异步操作、状态和回滚；接口接通后仍需明确可优化策略与真实效果标准。
 
 可复用的独立优化控制器见 [RSI Core](rsi-core/README.md)：提供任务适配接口、结构化补丁、冻结评测、证据绑定晋级和父版本继承，以及真实仓库检索实验。它与当前原神冻结运行时分开部署；本地实验不能替代原神的跨日实机晋级。
 
