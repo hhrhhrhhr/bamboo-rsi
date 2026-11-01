@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>org.bamboorsi</groupId><artifactId>aichatcore-voice-lab</artifactId><version>0.1.0</version>
+  <!-- Deliberately no private enterprise parent. Original selected source files are
+       compiled from a separately supplied checkout, never vendored or published. -->
+  <properties><maven.compiler.release>17</maven.compiler.release><project.build.sourceEncoding>UTF-8</project.build.sourceEncoding></properties>
+  <dependencies>
+    <dependency><groupId>org.projectlombok</groupId><artifactId>lombok</artifactId><version>1.18.38</version><scope>provided</scope></dependency>
+    <dependency><groupId>org.springframework</groupId><artifactId>spring-context</artifactId><version>6.2.7</version></dependency>
+    <dependency><groupId>org.springframework</groupId><artifactId>spring-web</artifactId><version>6.2.7</version></dependency>
+    <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot</artifactId><version>3.4.6</version></dependency>
+    <dependency><groupId>org.springframework.data</groupId><artifactId>spring-data-redis</artifactId><version>3.4.6</version></dependency>
+    <dependency><groupId>com.alibaba</groupId><artifactId>fastjson</artifactId><version>1.2.83</version></dependency>
+    <dependency><groupId>com.fasterxml.jackson.core</groupId><artifactId>jackson-annotations</artifactId><version>2.18.3</version></dependency>
+    <dependency><groupId>com.volcengine</groupId><artifactId>volcengine-java-sdk-ark-runtime</artifactId><version>0.2.43</version></dependency>
+    <dependency><groupId>jakarta.annotation</groupId><artifactId>jakarta.annotation-api</artifactId><version>2.1.1</version></dependency>
+    <dependency><groupId>javax.annotation</groupId><artifactId>javax.annotation-api</artifactId><version>1.3.2</version></dependency>
+    <dependency><groupId>org.slf4j</groupId><artifactId>slf4j-simple</artifactId><version>2.0.17</version></dependency>
+  </dependencies>
+  <build><plugins>
+    <plugin><groupId>org.codehaus.mojo</groupId><artifactId>build-helper-maven-plugin</artifactId><version>3.6.0</version><executions><execution><id>original-core</id><phase>generate-sources</phase><goals><goal>add-source</goal></goals><configuration><sources><source>${aichatcore.source}/aichatcore-core/src/main/java</source></sources></configuration></execution></executions></plugin>
+    <plugin><groupId>org.apache.maven.plugins</groupId><artifactId>maven-compiler-plugin</artifactId><version>3.13.0</version><configuration><release>17</release><includes>
+      <include>org/bamboorsi/voice/**/*.java</include>
+      <include>cn/xinfei/aichat/core/biz/playbook/handler/ExecutionContext.java</include>
+      <include>cn/xinfei/aichat/core/biz/playbook/handler/ExecutionHandler.java</include>
+      <include>cn/xinfei/aichat/core/biz/playbook/handler/HandlerResult.java</include>
+      <include>cn/xinfei/aichat/core/biz/playbook/handler/PreCheckHandler.java</include>
+      <include>cn/xinfei/aichat/core/biz/playbook/handler/PromptBuildHandler.java</include>
+      <include>cn/xinfei/aichat/core/biz/playbook/handler/LLMCallHandler.java</include>
+      <include>cn/xinfei/aichat/core/biz/playbook/handler/PostCheckHandler.java</include>
+      <include>cn/xinfei/aichat/core/biz/playbook/handler/PlaybookExecutionChain.java</include>
+      <include>cn/xinfei/aichat/core/service/playbook/domain/model/**/*.java</include>
+      <include>cn/xinfei/aichat/core/service/playbook/domain/event/*.java</include>
+      <include>cn/xinfei/aichat/core/service/playbook/domain/service/VariableReplacer.java</include>
+      <include>cn/xinfei/aichat/core/service/playbook/domain/service/VoiceSliceBuilder.java</include>
+      <include>cn/xinfei/aichat/core/service/playbook/infrastructure/config/PlaybookLlmConfig.java</include>
+      <include>cn/xinfei/aichat/core/service/playbook/infrastructure/config/PlaybookAlgoConfig.java</include>
+      <include>cn/xinfei/aichat/core/service/playbook/infrastructure/client/algo/**/*.java</include>
+      <include>cn/xinfei/aichat/core/service/playbook/infrastructure/client/llm/LLMClient.java</include>
+      <include>cn/xinfei/aichat/core/service/playbook/infrastructure/cache/HookCacheService.java</include>
+    </includes></configuration></plugin>
+    <plugin><groupId>org.apache.maven.plugins</groupId><artifactId>maven-dependency-plugin</artifactId><version>3.8.1</version></plugin>
+  </plugins></build>
+</project>

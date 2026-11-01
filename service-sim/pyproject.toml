@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bamboo-service-sim"
+version = "0.1.2"
+description = "Budgeted AI customer, service and operations roleplay for offline policy RSI"
+requires-python = ">=3.11"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = ["bamboo-service-feedback==0.1.0"]
+
+[project.scripts]
+bamboo-service-sim = "bamboo_service_sim.runner:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "../service-feedback/src", "../collections-lab/src", "../rsi-core/src", "../rsi-sdk/src", "../rsi-http/src"]
+testpaths = ["tests"]

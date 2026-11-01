@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+[project]
+name = "bamboo-voice-lab"
+version = "0.1.0"
+requires-python = ">=3.12"
+description = "Isolated spoken conversation evidence and aichatcore Java integration"
+license = "MIT"
+dependencies = ["bamboo-rsi-sdk==0.1.0", "vosk==0.3.45"]
+[tool.pytest.ini_options]
+pythonpath = ["src", "../rsi-core/src", "../rsi-sdk/src"]

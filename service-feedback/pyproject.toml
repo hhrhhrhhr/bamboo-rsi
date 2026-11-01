@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bamboo-service-feedback"
+version = "0.1.0"
+description = "Evidence-backed operations review and customer-service RSI intake"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = ["bamboo-collections-lab==0.1.0"]
+
+[project.scripts]
+bamboo-feedback = "bamboo_feedback.cli:main"
+
+[project.entry-points."bamboo_rsi.integrations"]
+"business.reviewed_collection_support" = "bamboo_feedback.bridge:create"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "../collections-lab/src", "../rsi-core/src", "../rsi-sdk/src", "../rsi-http/src"]
+testpaths = ["tests"]

@@ -10,6 +10,8 @@
 - `platform/`：执行内核、原神适配器、运行证据、录像归档、RSI 协调器及回归测试；保留文件账目示例用于验证通用平台。
 - `rsi-sdk/`：[业务接入 SDK](rsi-sdk/README.md)，统一任务契约、执行、独立核验、评测、候选晋级和继承；提供本地订单对账及仓库检索参考实现，支持安装业务插件。示例演示不代表生产业务或游戏验收。
 - `rsi-http/`：[企业 HTTP 接入](rsi-http/README.md)，为 Java、Go 等系统提供任务桥接与异步实验控制 API，附 OpenAPI、客户端示例、独立核验凭证和幂等恢复；只读/影子示例不代表生产业务验收。
+- `collections-lab/`：[信贷账户客服模拟与话术 RSI](collections-lab/README.md)，映射 aichatcore 会话字段，生成分批模拟对话，自动优化受限路由和话术并核验晋级、继承；不代表真实客户或回款效果。
+- `service-feedback/`：[客服体验反馈与运营审核](service-feedback/README.md)，汇总未知问题与客户原话，确认后进入候选与独立评测；心理推测不作事实，支持 Java/Go HTTP 接入和撤回追溯。
 - `integrations/`：固定版本 AutoCommission 源码、BetterGI 改造补丁及战斗策略。
 - `scripts/`：可复现构建、开发试跑和停止入口。
 - `android-app/`：[手机独立运行的王者荣耀实验适配器](android-app/README.md)，提供截图点选校准、Decision 有界技能、录像导出、策略候选与签名对照晋级流程；尚未通过手机实机对战或 RSI 晋级验收。
@@ -89,6 +91,10 @@ platform/.venv/Scripts/python.exe scripts/build_genshin_desktop.py --bettergi .r
 - 若想用开发入口运行本次构建，把构建输出的绝对路径写入本机 `.runtime/install-root.txt`。配置自己的战斗策略后，使用 `Test-Genshin-Dev.cmd`。停止入口为 `Stop-Genshin-Dev.cmd`。
 
 决策会向第三方模型服务发送游戏截图、任务状态、UID 范围信息及可选动作，属于联网调用。运行日志、截图与视频也可能含账号信息；公开分享前需另行检查。仓库的忽略规则和发布检查只是防误提交措施，不能代替密钥轮换。已公开或分享过的 Key 应在服务商处撤销并换新。
+
+真实模型分角色的客服模拟见 [AI 服务对话 RSI 试验](service-sim/README.md)：分批客户数据、间歇模拟运营审核、独立验证、晋级和父版本继承。所有客户与运营均为模拟角色，不能替代真实客户效果和真人审核。
+
+双向有声通话见 [Java 语音 RSI 实验](voice-lab/README.md)：直接编译调用 aichatcore 原有 Playbook 执行链，双方发声后经电话音质处理和 ASR，再根据实际听到的内容继续对话。保存原始音频、误听、模型调用、AI 运营审查及独立配对评测；优化提示词与语速，不能把模拟通话指标称为真实客户满意度。该模块使用隔离存储，不连接真实电话或企业数据库。
 
 ## RSI 验收边界
 

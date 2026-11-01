@@ -1,0 +1,52 @@
+{
+  "repository": "https://github.com/hhrhhrhhr/aichatcore",
+  "commit": "8871715f899642d264df82ea3dbc68bddc3800e8",
+  "inspection": "schema_and_control_flow_only_no_source_code_copied",
+  "files": {
+    "aichatcore-core/src/main/java/cn/xinfei/aichat/core/dao/playbook/persistence/SessionTurnEntity.java": "bd7843334beb6e8ec968def00e33907205a1ce509583f164f4fd2db5225dcb74",
+    "aichatcore-core/src/main/java/cn/xinfei/aichat/core/dao/playbook/repository/PlaybookConfigRepository.java": "4f2799fa4c2c8d093840d0f75636e5656f58e9d4af0de422fcd5f667f72d2eba",
+    "aichatcore-core/src/main/java/cn/xinfei/aichat/core/service/playbook/domain/model/StructuredOutput.java": "53c58b167ece5eb5a62d516c7af2e11aa567ebdaa5211fb98b1e1131c136b6c4",
+    "aichatcore-adaptor/src/main/java/cn/xinfei/aichat/core/controller/PlaybookSessionController.java": "0f62b8511b6c67d0b4ba7e1a1e66915eb7b8a9043531fe37b8cec4b44d0af88c",
+    "aichatcore-adaptor/src/main/java/cn/xinfei/aichat/core/adapter/PlaybookResponseAdapter.java": "e5bbffd78c956af4e13391a874829e13774339a1ca96d4effea02c354536e42d"
+  },
+  "session_turn_fields": [
+    "id",
+    "sessionId",
+    "turnIndex",
+    "playbookId",
+    "currentStep",
+    "nextStep",
+    "userQuery",
+    "botReply",
+    "llmInputJson",
+    "llmOutputJson",
+    "referenceScriptId",
+    "voiceSlices",
+    "toolCalls",
+    "safetyVerdict",
+    "isFaq",
+    "latencyMs",
+    "createdTime",
+    "llmLatencyMs",
+    "preInput",
+    "preOutput",
+    "postInput",
+    "postOutput",
+    "roundId"
+  ],
+  "session_read_endpoint": "POST /api/v1/playbook/session/turns",
+  "chat_endpoint": "POST /api/v1/playbook/chat",
+  "structured_output": [
+    "output",
+    "step",
+    "utterId",
+    "handoff",
+    "originUtter"
+  ],
+  "handoff": [
+    "next_step",
+    "END",
+    "HUMAN"
+  ],
+  "deployment_performed": false
+}

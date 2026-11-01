@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bamboo-collections-lab"
+version = "0.1.0"
+description = "Synthetic collection-support dialogue benchmarks and bounded policy RSI"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = ["bamboo-rsi-sdk==0.1.0", "bamboo-rsi-http==0.1.0"]
+
+[project.scripts]
+bamboo-collections = "bamboo_collections.cli:main"
+
+[project.entry-points."bamboo_rsi.integrations"]
+"business.collection_support" = "bamboo_collections.integration:create"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.data-files]
+"share/bamboo-collections-lab" = ["source-contract.json", "README.md"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "../rsi-core/src", "../rsi-sdk/src", "../rsi-http/src"]
+testpaths = ["tests"]
